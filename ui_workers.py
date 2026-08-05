@@ -20,14 +20,6 @@ prepare_qt_runtime()
 
 from PySide6.QtCore import QThread, Signal
 
-from calibration_collector import (
-    DEFAULT_DATA_PATH,
-    DEFAULT_SEQUENCE,
-    GuidedCalibrationCollector,
-    extract_feature_window,
-)
-from finger_classifier import DEFAULT_MODEL_PATH as DEFAULT_FINGER_MODEL_PATH
-from finger_classifier import FingerClassifier, train_model
 from keyboard_geometry import (
     KeyboardPlane,
     draw_keyboard_projection,
@@ -37,9 +29,7 @@ from keyboard_layouts import expected_finger
 from kinematics import (
     FULL_FRAME_ROI,
     HandInferencePipeline,
-    HybridDecisionEngine,
     KeyConditionedContactVerifier,
-    KinematicsSnapshot,
     draw_hand_overlay,
     normalized_roi,
 )
@@ -169,7 +159,7 @@ class KeystrokeRecord:
     observed: str
     confidence: float
     rejection_reason: str = ""
-    decision_source: str = "heuristic"
+    decision_source: str = "contact"
 
 
 @dataclass(slots=True)
@@ -179,9 +169,6 @@ class _PendingKey:
     expected: str
     wall_timestamp: str
     frames_before: tuple[FramePacket, ...] = ()
-    best_quality: float = float("-inf")
-    observed: str = "Unknown"
-    confidence: float = 0.0
 
 
 class CameraThread(QThread):
@@ -387,30 +374,10 @@ class KeyboardThread(QThread):
             self.collector.stop()
 
 
-class ModelTrainingThread(QThread):
-    completed = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, data_path: Path, model_path: Path) -> None:
-        super().__init__()
-        self.setObjectName("finger-model-training")
-        self.data_path = Path(data_path)
-        self.model_path = Path(model_path)
-
-    def run(self) -> None:
-        try:
-            self.completed.emit(train_model(self.data_path, self.model_path))
-        except BaseException as exc:
-            self.failed.emit(f"Model training failed: {exc}")
-
-
 class VisionThread(QThread):
     ready = Signal(str)
     failed = Signal(str)
     keystroke_ready = Signal(object)
-    calibration_progress = Signal(object)
-    calibration_finished = Signal(str)
-    model_status = Signal(str)
 
     def __init__(
         self,
@@ -424,13 +391,9 @@ class VisionThread(QThread):
         processing_height: int = 720,
         inference_fps: float = 30.0,
         keyboard_layout: str,
-        calibration_path: Path = DEFAULT_DATA_PATH,
-        finger_model_path: Path = DEFAULT_FINGER_MODEL_PATH,
-        spatial_threshold_px: float = 120.0,
         keyboard_roi: tuple[float, float, float, float] | None = None,
         keyboard_plane_points: tuple[tuple[float, float], ...] | None = None,
         digital_zoom: bool = False,
-        disable_ml: bool = False,
     ) -> None:
         super().__init__()
         self.setObjectName("vision-compositor")
@@ -443,30 +406,11 @@ class VisionThread(QThread):
         self.processing_height = processing_height
         self.inference_fps = inference_fps
         self.keyboard_layout = keyboard_layout
-        self.calibration_path = Path(calibration_path)
-        self.finger_model_path = Path(finger_model_path)
-        self.spatial_threshold_px = spatial_threshold_px
         self._keyboard_roi = normalized_roi(keyboard_roi)
         self._keyboard_plane_points = keyboard_plane_points
         self._digital_zoom = bool(digital_zoom and self._keyboard_roi is not None)
-        self.disable_ml = disable_ml
         self._stop_event = threading.Event()
         self._control_lock = threading.Lock()
-        self._calibration_command: tuple[str, str, int, str] | None = None
-        self._reload_model = False
-
-    def start_calibration(
-        self,
-        sequence: str = DEFAULT_SEQUENCE,
-        repeats: int = 5,
-        set_name: str = "Custom",
-    ) -> None:
-        with self._control_lock:
-            self._calibration_command = ("start", sequence, repeats, set_name)
-
-    def cancel_calibration(self) -> None:
-        with self._control_lock:
-            self._calibration_command = ("cancel", "", 0, "")
 
     def set_keyboard_view(
         self,
@@ -480,10 +424,6 @@ class VisionThread(QThread):
     def set_keyboard_plane(self, points) -> None:
         with self._control_lock:
             self._keyboard_plane_points = points
-
-    def request_model_reload(self) -> None:
-        with self._control_lock:
-            self._reload_model = True
 
     def stop(self) -> None:
         self.requestInterruption()
@@ -529,36 +469,11 @@ class VisionThread(QThread):
         )
         return frame[top:bottom, left:right], actual_roi
 
-    @staticmethod
-    def _update_pending(
-        pending: list[_PendingKey], snapshot: KinematicsSnapshot
-    ) -> None:
-        if snapshot.timestamp_ns == 0:
-            return
-        for item in pending:
-            delta = abs(snapshot.timestamp_ns - item.timestamp_ns)
-            if delta > 80_000_000:
-                continue
-            candidates = [
-                (hand.active_score, hand.handedness, hand.active_finger)
-                for hand in snapshot.hands
-                if hand.active_finger is not None
-            ]
-            score, handedness, finger = max(candidates, default=(0.0, None, None))
-            quality = score * (1.0 - 0.35 * delta / 80_000_000)
-            if quality > item.best_quality:
-                item.best_quality = quality
-                item.confidence = score
-                item.observed = (
-                    f"{handedness} {finger}" if score >= 0.28 and finger else "Unknown"
-                )
-
     def _drain_keys(
         self,
         pipeline: HandInferencePipeline,
         pending: list[_PendingKey],
         wall_clock_offset_ns: int,
-        collector: GuidedCalibrationCollector,
     ) -> float | None:
         latest_delta: float | None = None
         while True:
@@ -589,9 +504,6 @@ class VisionThread(QThread):
                 )
                 continue
             pipeline.engine.register_keypress(event.timestamp_ns, event.label)
-            calibration_update = collector.handle_keypress(event.timestamp_ns, event.label)
-            if calibration_update is not None:
-                self.calibration_progress.emit(calibration_update)
             pending.append(
                 _PendingKey(
                     event.timestamp_ns,
@@ -606,46 +518,9 @@ class VisionThread(QThread):
                 )
             )
 
-    def _handle_control_commands(
-        self,
-        collector: GuidedCalibrationCollector,
-        decision: HybridDecisionEngine,
-    ) -> None:
-        with self._control_lock:
-            command = self._calibration_command
-            self._calibration_command = None
-            reload_model = self._reload_model
-            self._reload_model = False
-
-        if command is not None:
-            action, sequence, repeats, set_name = command
-            update = (
-                collector.start(sequence, repeats, set_name)
-                if action == "start"
-                else collector.cancel()
-            )
-            self.calibration_progress.emit(update)
-
-        if reload_model and self.disable_ml:
-            self.model_status.emit("ML disabled; model reload skipped")
-        elif reload_model:
-            try:
-                decision.classifier = FingerClassifier.load(self.finger_model_path)
-                self.model_status.emit(f"Loaded {self.finger_model_path.name}")
-            except BaseException as exc:
-                decision.classifier = None
-                self.model_status.emit(f"Finger model unavailable: {exc}")
-
     def run(self) -> None:
         pipeline: HandInferencePipeline | None = None
         posture = PostureMonitor()
-        collector = GuidedCalibrationCollector(
-            self.calibration_path, keyboard_layout=self.keyboard_layout
-        )
-        decision = HybridDecisionEngine(
-            spatial_threshold_px=self.spatial_threshold_px,
-            keyboard_roi=self._keyboard_roi,
-        )
         contact_verifier = KeyConditionedContactVerifier()
         pending: list[_PendingKey] = []
         last_frame_sequence = -1
@@ -660,22 +535,11 @@ class VisionThread(QThread):
                 num_hands=2,
                 max_fps=self.inference_fps,
             )
-            if not self.disable_ml and self.finger_model_path.exists():
-                try:
-                    decision.classifier = FingerClassifier.load(self.finger_model_path)
-                    self.model_status.emit(
-                        f"Loaded legacy fallback {self.finger_model_path.name}"
-                    )
-                except BaseException as exc:
-                    self.model_status.emit(f"Finger model unavailable: {exc}")
-            elif self.disable_ml:
-                self.model_status.emit("ML disabled: key-conditioned contact mode only")
             self.ready.emit("MediaPipe CPU pipeline ready")
 
             while not self._stop_event.is_set() and not self.isInterruptionRequested():
-                self._handle_control_commands(collector, decision)
                 new_delta = self._drain_keys(
-                    pipeline, pending, wall_clock_offset_ns, collector
+                    pipeline, pending, wall_clock_offset_ns
                 )
                 if new_delta is not None:
                     latest_key_delta = new_delta
@@ -690,7 +554,6 @@ class VisionThread(QThread):
                     keyboard_roi = self._keyboard_roi
                     keyboard_plane_points = self._keyboard_plane_points
                     digital_zoom = self._digital_zoom
-                decision.set_keyboard_roi(keyboard_roi)
                 if keyboard_plane_points != applied_plane_points:
                     try:
                         keyboard_plane = (
@@ -707,25 +570,16 @@ class VisionThread(QThread):
                 display = self._resize(source, self.processing_height)
                 pipeline.submit(display, packet.timestamp_ns, view_roi)
                 snapshot = pipeline.engine.snapshot()
-                self._update_pending(pending, snapshot)
-
-                calibration_update = collector.process_ready(
-                    pipeline.engine, packet.timestamp_ns
-                )
-                if calibration_update is not None:
-                    self.calibration_progress.emit(calibration_update)
-                    if calibration_update.complete:
-                        self.calibration_finished.emit(str(self.calibration_path))
 
                 for item in list(pending):
                     if (
                         packet.timestamp_ns - item.timestamp_ns >= 80_000_000
                         and snapshot.timestamp_ns >= item.timestamp_ns + 30_000_000
                     ):
-                        observed = item.observed
-                        confidence = item.confidence
-                        rejection_reason = ""
-                        decision_source = "heuristic"
+                        observed = "Unknown"
+                        confidence = 0.0
+                        rejection_reason = "Keyboard Plane Not Calibrated"
+                        decision_source = "contact"
                         if keyboard_plane is not None:
                             history = pipeline.engine.history_window(
                                 item.timestamp_ns,
@@ -758,33 +612,6 @@ class VisionThread(QThread):
                             rejection_reason = (
                                 result.reason if result.label == "Unknown" else ""
                             )
-                            decision_source = "contact"
-                        elif not self.disable_ml:
-                            window = extract_feature_window(pipeline.engine, item.timestamp_ns)
-                            if window is None:
-                                observed = "Unknown"
-                                confidence = 0.0
-                                rejection_reason = "Hand Occluded"
-                                decision_source = "guardrail"
-                            else:
-                                result = decision.classify(
-                                    window.values,
-                                    item.key,
-                                    window.fingertip_positions,
-                                    (packet.image.shape[1], packet.image.shape[0]),
-                                    heuristic_label=item.observed,
-                                    heuristic_confidence=item.confidence,
-                                )
-                                observed = result.label
-                                confidence = result.confidence
-                                rejection_reason = (
-                                    result.reason if result.label == "Unknown" else ""
-                                )
-                                decision_source = f"legacy-{result.source}"
-                        else:
-                            observed = "Unknown"
-                            confidence = 0.0
-                            rejection_reason = "Keyboard Plane Not Calibrated"
                             decision_source = "contact"
                         self.keystroke_ready.emit(
                             KeystrokeRecord(

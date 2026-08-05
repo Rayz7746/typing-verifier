@@ -58,13 +58,6 @@ def normalized_roi(roi) -> tuple[float, float, float, float] | None:
     return x, y, width, height
 
 
-def point_in_roi(
-    point: tuple[float, float], roi: tuple[float, float, float, float]
-) -> bool:
-    x, y, width, height = roi
-    return x <= point[0] <= x + width and y <= point[1] <= y + height
-
-
 class OneEuroFilter:
     """Vectorized adaptive low-pass filter with high-speed responsiveness."""
 
@@ -147,15 +140,6 @@ class KinematicsSnapshot:
     timestamp_ns: int
     hands: tuple[HandAnalysis, ...]
     key_prediction: KeyPrediction | None
-
-
-@dataclass(frozen=True, slots=True)
-class HybridPrediction:
-    label: str
-    confidence: float
-    distance_px: float | None
-    source: str
-    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,92 +368,6 @@ def _finger_flexion(points: np.ndarray, joints: tuple[int, int, int, int]) -> tu
         math.pi - _joint_angle(points[mcp], points[pip], points[dip]),
         math.pi - _joint_angle(points[pip], points[dip], points[tip]),
     )
-
-
-class HybridDecisionEngine:
-    """Apply model confidence and key-region spatial safety guardrails."""
-
-    def __init__(
-        self,
-        classifier=None,
-        *,
-        minimum_confidence: float = 0.60,
-        spatial_threshold_px: float = 120.0,
-        keyboard_roi: tuple[float, float, float, float] | None = None,
-    ) -> None:
-        self.classifier = classifier
-        self.minimum_confidence = minimum_confidence
-        self.spatial_threshold_px = spatial_threshold_px
-        self.keyboard_roi = normalized_roi(keyboard_roi)
-
-    def set_keyboard_roi(self, roi) -> None:
-        self.keyboard_roi = normalized_roi(roi)
-
-    def classify(
-        self,
-        features: np.ndarray,
-        key_label: str,
-        fingertip_positions: dict[str, tuple[float, float]],
-        frame_size: tuple[int, int],
-        *,
-        heuristic_label: str = "Unknown",
-        heuristic_confidence: float = 0.0,
-    ) -> HybridPrediction:
-        if self.classifier is None:
-            label, confidence, source = (
-                heuristic_label,
-                heuristic_confidence,
-                "heuristic",
-            )
-        else:
-            label, confidence = self.classifier.predict_one(features)
-            source = "ml"
-
-        fingertip = fingertip_positions.get(label)
-        distance_px: float | None = None
-        if fingertip is None:
-            reason = (
-                "No Active Finger"
-                if label == "Unknown" and fingertip_positions
-                else "Hand Occluded"
-            )
-            return HybridPrediction(
-                "Unknown", confidence, None, source, reason
-            )
-        if self.keyboard_roi is not None and not point_in_roi(fingertip, self.keyboard_roi):
-            return HybridPrediction(
-                "Unknown", confidence, None, source, "Outside ROI"
-            )
-        if source == "ml" and confidence < self.minimum_confidence:
-            return HybridPrediction(
-                "Unknown",
-                confidence,
-                None,
-                "ml",
-                f"Low Conf: {confidence:.0%} < {self.minimum_confidence:.0%}",
-            )
-        if self.classifier is None:
-            return HybridPrediction(label, confidence, None, source, "Accepted heuristic")
-
-        target = self.classifier.target_for_key(key_label)
-        if target is None:
-            return HybridPrediction(
-                "Unknown", confidence, None, "ml", "Uncalibrated Key Region"
-            )
-        width, height = frame_size
-        dx = (fingertip[0] - target[0]) * width
-        dy = (fingertip[1] - target[1]) * height
-        distance_px = math.hypot(dx, dy)
-        if distance_px > self.spatial_threshold_px:
-            return HybridPrediction(
-                "Unknown",
-                confidence,
-                distance_px,
-                "ml",
-                f"Key Distance: {distance_px:.0f}px > {self.spatial_threshold_px:.0f}px",
-            )
-
-        return HybridPrediction(label, confidence, distance_px, "ml", "Accepted")
 
 
 class KinematicsEngine:

@@ -23,7 +23,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
-    QDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -33,11 +32,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QLayout,
     QMainWindow,
-    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
@@ -45,14 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from calibration_collector import (
-    CALIBRATION_SETS,
-    DEFAULT_DATA_PATH as DEFAULT_CALIBRATION_PATH,
-    CalibrationProgress,
-)
 from fetch_model import DEFAULT_MODEL_PATH, ensure_model
-from finger_classifier import DEFAULT_MODEL_PATH as DEFAULT_FINGER_MODEL_PATH
-from finger_classifier import TrainingResult
 from keyboard_geometry import (
     KeyboardPlane,
     keyboard_roi_from_points,
@@ -67,7 +57,6 @@ from ui_workers import (
     KeyboardThread,
     KeystrokeRecord,
     LatestValueSlot,
-    ModelTrainingThread,
     RenderedFrame,
     VisionTelemetry,
     VisionThread,
@@ -140,14 +129,6 @@ QFrame#telemetryCard {
     border: 1px solid #26374a;
     border-radius: 9px;
 }
-QProgressBar {
-    background: #111923;
-    border: 1px solid #314158;
-    border-radius: 6px;
-    min-height: 16px;
-    text-align: center;
-}
-QProgressBar::chunk { background: #2188d0; border-radius: 5px; }
 QLabel#cardTitle { color: #8fa2b5; font-size: 11px; font-weight: 600; }
 QLabel#cardValue { color: #f1f7fc; font-size: 23px; font-weight: 700; }
 QLabel#postureBanner {
@@ -485,115 +466,6 @@ class TelemetryCard(QFrame):
         self.value_label.setText(value)
 
 
-class CalibrationDialog(QDialog):
-    cancelled = Signal()
-    start_requested = Signal(str, int, str)
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self._finished = False
-        self._started = False
-        self.setWindowTitle("Guided finger calibration")
-        self.setModal(False)
-        self.setMinimumWidth(560)
-
-        layout = QVBoxLayout(self)
-        heading = QLabel("Guided full-keyboard calibration")
-        heading.setStyleSheet("font-size: 18px; font-weight: 700;")
-        description = QLabel(
-            "Choose a key set and complete several passes. Wrong keys are ignored; "
-            "accepted sessions append to your existing personal dataset."
-        )
-        description.setWordWrap(True)
-
-        options = QFormLayout()
-        self.set_combo = QComboBox()
-        for set_name in CALIBRATION_SETS:
-            self.set_combo.addItem(set_name, set_name)
-        self.rounds_spin = QSpinBox()
-        self.rounds_spin.setRange(5, 10)
-        self.rounds_spin.setValue(5)
-        self.rounds_spin.setSuffix(" passes")
-        self.sequence_label = QLabel("")
-        self.sequence_label.setWordWrap(True)
-        options.addRow("Key set", self.set_combo)
-        options.addRow("Repetitions", self.rounds_spin)
-        options.addRow("Sequence", self.sequence_label)
-
-        self.key_label = QLabel("—")
-        self.key_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.key_label.setStyleSheet(
-            "font-size: 54px;font-weight:800;background:#182b3d;"
-            "border:2px solid #2188d0;border-radius:12px;padding:18px;"
-        )
-        self.progress = QProgressBar()
-        self.count_label = QLabel("Choose a set, then begin calibration")
-        self.message_label = QLabel("")
-        self.message_label.setWordWrap(True)
-        self.start_button = QPushButton("Begin Calibration")
-        self.start_button.clicked.connect(self._begin)
-        self.cancel_button = QPushButton("Cancel calibration")
-        self.cancel_button.clicked.connect(self.reject)
-        self.set_combo.currentIndexChanged.connect(self._update_sequence_label)
-        self.rounds_spin.valueChanged.connect(self._update_sequence_label)
-
-        layout.addWidget(heading)
-        layout.addWidget(description)
-        layout.addLayout(options)
-        layout.addWidget(self.key_label)
-        layout.addWidget(self.progress)
-        layout.addWidget(self.count_label)
-        layout.addWidget(self.message_label)
-        layout.addWidget(self.start_button)
-        layout.addWidget(self.cancel_button)
-        self._update_sequence_label()
-        disable_keyboard_focus(self)
-
-    def _update_sequence_label(self, *_args) -> None:
-        sequence = CALIBRATION_SETS[str(self.set_combo.currentData())]
-        visible = sequence.replace(" ", "␠")
-        total = len(sequence) * self.rounds_spin.value()
-        self.sequence_label.setText(f"{visible}  ({total} samples)")
-
-    def _begin(self) -> None:
-        set_name = str(self.set_combo.currentData())
-        sequence = CALIBRATION_SETS[set_name]
-        rounds = self.rounds_spin.value()
-        self._started = True
-        self.set_combo.setEnabled(False)
-        self.rounds_spin.setEnabled(False)
-        self.start_button.setEnabled(False)
-        self.start_requested.emit(sequence, rounds, set_name)
-
-    def update_progress(self, update: CalibrationProgress) -> None:
-        self.progress.setRange(0, max(1, update.total))
-        self.progress.setValue(update.index)
-        prompt = update.current_key
-        self.key_label.setText("SPACE" if prompt == " " else (prompt.upper() or "DONE"))
-        self.count_label.setText(
-            f"{update.set_name} · Pass {update.round_index or update.rounds}/{update.rounds} · "
-            f"Accepted {update.accepted}/{update.total} · Target samples "
-            f"{update.target_sample_count} · Dataset total {update.dataset_samples} · "
-            f"Ignored {update.rejected}"
-        )
-        self.message_label.setText(update.message)
-        if update.complete:
-            self._finished = True
-            self.key_label.setText("✓")
-            self.cancel_button.setText("Close")
-
-    def reject(self) -> None:
-        if self._started and not self._finished:
-            self.cancelled.emit()
-        super().reject()
-
-    def keyPressEvent(self, event: QKeyEvent) -> None:
-        event.ignore()
-
-    def keyReleaseEvent(self, event: QKeyEvent) -> None:
-        event.ignore()
-
-
 class TypingVerifierWindow(QMainWindow):
     def __init__(
         self,
@@ -601,20 +473,12 @@ class TypingVerifierWindow(QMainWindow):
         *,
         processing_height: int,
         inference_fps: float,
-        calibration_path: Path = DEFAULT_CALIBRATION_PATH,
-        finger_model_path: Path = DEFAULT_FINGER_MODEL_PATH,
-        spatial_threshold_px: float = 120.0,
         app_config_path: Path = DEFAULT_APP_CONFIG_PATH,
-        disable_ml: bool = False,
     ):
         super().__init__()
         self.model_path = model_path
         self.processing_height = processing_height
         self.inference_fps = inference_fps
-        self.calibration_path = Path(calibration_path)
-        self.finger_model_path = Path(finger_model_path)
-        self.spatial_threshold_px = spatial_threshold_px
-        self.disable_ml = disable_ml
         self.app_config_path = Path(app_config_path)
         self._app_config, self._config_warning = self._load_app_config()
         self.keyboard_roi = normalized_roi(self._app_config.get("keyboard_roi"))
@@ -643,8 +507,6 @@ class TypingVerifierWindow(QMainWindow):
         self._last_dashboard_update_ns = 0
         self._pending_plane_activation = False
         self._plane_calibration_active = False
-        self.calibration_dialog: CalibrationDialog | None = None
-        self.training_thread: ModelTrainingThread | None = None
 
         self.setWindowTitle("Real-Time Touch-Typing Verifier")
         self.resize(1500, 920)
@@ -917,7 +779,6 @@ class TypingVerifierWindow(QMainWindow):
         sidebar.setSpacing(10)
         sidebar.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         sidebar.addWidget(self._build_controls())
-        sidebar.addWidget(self._build_calibration_controls())
         sidebar.addWidget(self._build_dashboard())
         sidebar.addStretch(1)
         sidebar_widget = QWidget()
@@ -1042,35 +903,6 @@ class TypingVerifierWindow(QMainWindow):
         )
         return group
 
-    def _build_calibration_controls(self) -> QGroupBox:
-        group = QGroupBox("Legacy personal finger model")
-        layout = QVBoxLayout(group)
-        explanation = QLabel(
-            "Optional fallback when no keyboard plane is available. The contact verifier "
-            "does not require model training."
-        )
-        explanation.setWordWrap(True)
-        self.calibrate_button = QPushButton("Start Guided Calibration")
-        self.train_button = QPushButton("Train Model")
-        self.calibrate_button.clicked.connect(self._start_calibration)
-        self.train_button.clicked.connect(self._train_model)
-        if self.disable_ml:
-            explanation.setText(
-                "ML is disabled. Runtime decisions use only the calibrated keyboard plane "
-                "and key-conditioned fingertip trajectories."
-            )
-            self.calibrate_button.setEnabled(False)
-            self.train_button.setEnabled(False)
-        layout.addWidget(explanation)
-        layout.addWidget(self.calibrate_button)
-        layout.addWidget(self.train_button)
-        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
-        group.setMinimumHeight(group.sizeHint().height())
-        group.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
-        )
-        return group
-
     def _build_dashboard(self) -> QGroupBox:
         group = QGroupBox("Live telemetry")
         grid = QGridLayout(group)
@@ -1139,20 +971,13 @@ class TypingVerifierWindow(QMainWindow):
             processing_height=self.processing_height,
             inference_fps=self.inference_fps,
             keyboard_layout=str(self.layout_combo.currentData()),
-            calibration_path=self.calibration_path,
-            finger_model_path=self.finger_model_path,
-            spatial_threshold_px=self.spatial_threshold_px,
             keyboard_roi=self.keyboard_roi,
             keyboard_plane_points=self.keyboard_plane_points,
             digital_zoom=self.digital_zoom,
-            disable_ml=self.disable_ml,
         )
         self.vision_thread.ready.connect(self.statusBar().showMessage)
         self.vision_thread.failed.connect(self._show_error)
         self.vision_thread.keystroke_ready.connect(self._append_keystroke)
-        self.vision_thread.calibration_progress.connect(self._on_calibration_progress)
-        self.vision_thread.calibration_finished.connect(self._on_calibration_finished)
-        self.vision_thread.model_status.connect(self.statusBar().showMessage)
         self.camera_thread.start()
         self.vision_thread.start()
 
@@ -1172,80 +997,6 @@ class TypingVerifierWindow(QMainWindow):
         self._stop_pipeline()
         self._start_pipeline()
         self.apply_button.setEnabled(True)
-
-    def _start_calibration(self) -> None:
-        if self.disable_ml:
-            self._show_error("ML is disabled; guided model calibration is unavailable")
-            return
-        if self.vision_thread is None:
-            self._show_error("Vision worker is not running")
-            return
-        if self.calibration_dialog is not None:
-            self.calibration_dialog.close()
-        dialog = CalibrationDialog(self)
-        dialog.cancelled.connect(self._cancel_calibration)
-        dialog.start_requested.connect(self._begin_calibration_session)
-        dialog.finished.connect(lambda _result: self._clear_calibration_dialog(dialog))
-        self.calibration_dialog = dialog
-        dialog.show()
-        dialog.raise_()
-
-    def _begin_calibration_session(
-        self, sequence: str, rounds: int, set_name: str
-    ) -> None:
-        if self.vision_thread is not None:
-            self.vision_thread.start_calibration(sequence, rounds, set_name)
-
-    def _cancel_calibration(self) -> None:
-        if self.vision_thread is not None:
-            self.vision_thread.cancel_calibration()
-
-    def _clear_calibration_dialog(self, dialog: CalibrationDialog) -> None:
-        if self.calibration_dialog is dialog:
-            self.calibration_dialog = None
-
-    def _on_calibration_progress(self, update: CalibrationProgress) -> None:
-        if self.calibration_dialog is not None:
-            self.calibration_dialog.update_progress(update)
-
-    def _on_calibration_finished(self, path: str) -> None:
-        self.train_button.setEnabled(True)
-        self.statusBar().showMessage(f"Calibration dataset saved: {path}")
-
-    def _train_model(self) -> None:
-        if self.disable_ml:
-            self._show_error("ML is disabled; no model will be loaded or trained")
-            return
-        if self.training_thread is not None and self.training_thread.isRunning():
-            return
-        if not self.calibration_path.exists():
-            self._show_error("Run Guided Calibration before training the model")
-            return
-        self.train_button.setEnabled(False)
-        self.statusBar().showMessage("Training RandomForest in a background thread…")
-        worker = ModelTrainingThread(self.calibration_path, self.finger_model_path)
-        worker.completed.connect(self._on_training_complete)
-        worker.failed.connect(self._on_training_failed)
-        worker.finished.connect(self._release_training_thread)
-        self.training_thread = worker
-        worker.start()
-
-    def _on_training_complete(self, result: TrainingResult) -> None:
-        self.statusBar().showMessage(
-            f"Model trained: {result.samples} samples, {result.classes} classes, "
-            f"training accuracy {result.training_accuracy:.1%}"
-        )
-        if self.vision_thread is not None:
-            self.vision_thread.request_model_reload()
-
-    def _on_training_failed(self, message: str) -> None:
-        self._show_error(message)
-
-    def _release_training_thread(self) -> None:
-        self.train_button.setEnabled(True)
-        if self.training_thread is not None:
-            self.training_thread.deleteLater()
-            self.training_thread = None
 
     def _refresh(self) -> None:
         if self.rendered_frames is None:
@@ -1350,8 +1101,6 @@ class TypingVerifierWindow(QMainWindow):
         self._stop_pipeline()
         self.keyboard_thread.stop()
         self.keyboard_thread.wait(2000)
-        if self.training_thread is not None:
-            self.training_thread.wait(5000)
         event.accept()
 
 
@@ -1360,26 +1109,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--processing-height", type=int, default=720)
     parser.add_argument("--inference-fps", type=float, default=30.0)
-    parser.add_argument("--calibration-data", type=Path, default=DEFAULT_CALIBRATION_PATH)
-    parser.add_argument("--finger-model", type=Path, default=DEFAULT_FINGER_MODEL_PATH)
     parser.add_argument(
         "--disable-ml",
         action="store_true",
-        help="Do not load, reload, collect for, or train the legacy finger classifier",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--app-config", type=Path, default=DEFAULT_APP_CONFIG_PATH)
-    parser.add_argument("--spatial-threshold-px", type=float, default=120.0)
     return parser.parse_args(argv)
 
 
 def main() -> int:
     args = parse_args()
-    if (
-        args.processing_height <= 0
-        or args.inference_fps <= 0
-        or args.spatial_threshold_px <= 0
-    ):
-        print("processing height, inference FPS, and spatial threshold must be positive", file=sys.stderr)
+    if args.processing_height <= 0 or args.inference_fps <= 0:
+        print("processing height and inference FPS must be positive", file=sys.stderr)
         return 2
     try:
         model_path = ensure_model(args.model)
@@ -1395,11 +1137,7 @@ def main() -> int:
         model_path,
         processing_height=args.processing_height,
         inference_fps=args.inference_fps,
-        calibration_path=args.calibration_data,
-        finger_model_path=args.finger_model,
-        spatial_threshold_px=args.spatial_threshold_px,
         app_config_path=args.app_config,
-        disable_ml=args.disable_ml,
     )
     window.show()
     return app.exec()
