@@ -95,7 +95,10 @@ class HandAnalysis:
     local_landmarks: np.ndarray
     palm_normal: np.ndarray
     tip_velocity_image: dict[str, np.ndarray]
+    tip_velocity_local: dict[str, np.ndarray]
     downward_velocity: dict[str, float]
+    pip_flexion_rate: dict[str, float]
+    dip_flexion_rate: dict[str, float]
     flexion_rate: dict[str, float]
     finger_scores: dict[str, float]
     active_finger: str | None
@@ -123,6 +126,15 @@ class KinematicsSnapshot:
     key_prediction: KeyPrediction | None
 
 
+@dataclass(frozen=True, slots=True)
+class HybridPrediction:
+    label: str
+    confidence: float
+    distance_px: float | None
+    source: str
+    reason: str
+
+
 @dataclass(slots=True)
 class _TrackState:
     world_filter: OneEuroFilter
@@ -130,7 +142,7 @@ class _TrackState:
     timestamp_ns: int | None = None
     local_landmarks: np.ndarray | None = None
     image_landmarks: np.ndarray | None = None
-    flexion: dict[str, float] | None = None
+    flexion: dict[str, tuple[float, float]] | None = None
 
 
 def _unit(vector: np.ndarray) -> np.ndarray:
@@ -173,11 +185,79 @@ def _joint_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     return math.acos(float(np.clip(np.dot(first, second), -1.0, 1.0)))
 
 
-def _finger_flexion(points: np.ndarray, joints: tuple[int, int, int, int]) -> float:
+def _finger_flexion(points: np.ndarray, joints: tuple[int, int, int, int]) -> tuple[float, float]:
     mcp, pip, dip, tip = joints
-    return (math.pi - _joint_angle(points[mcp], points[pip], points[dip])) + (
-        math.pi - _joint_angle(points[pip], points[dip], points[tip])
+    return (
+        math.pi - _joint_angle(points[mcp], points[pip], points[dip]),
+        math.pi - _joint_angle(points[pip], points[dip], points[tip]),
     )
+
+
+class HybridDecisionEngine:
+    """Apply model confidence and key-region spatial safety guardrails."""
+
+    def __init__(
+        self,
+        classifier=None,
+        *,
+        minimum_confidence: float = 0.60,
+        spatial_threshold_px: float = 120.0,
+    ) -> None:
+        self.classifier = classifier
+        self.minimum_confidence = minimum_confidence
+        self.spatial_threshold_px = spatial_threshold_px
+
+    def classify(
+        self,
+        features: np.ndarray,
+        key_label: str,
+        fingertip_positions: dict[str, tuple[float, float]],
+        frame_size: tuple[int, int],
+        *,
+        heuristic_label: str = "Unknown",
+        heuristic_confidence: float = 0.0,
+    ) -> HybridPrediction:
+        if self.classifier is None:
+            return HybridPrediction(
+                heuristic_label,
+                heuristic_confidence,
+                None,
+                "heuristic",
+                "No trained model is loaded",
+            )
+
+        label, confidence = self.classifier.predict_one(features)
+        if confidence < self.minimum_confidence:
+            return HybridPrediction(
+                "Unknown", confidence, None, "ml", "Below confidence threshold"
+            )
+
+        target = self.classifier.target_for_key(key_label)
+        fingertip = fingertip_positions.get(label)
+        distance_px: float | None = None
+        if target is None:
+            return HybridPrediction(
+                "Unknown", confidence, None, "ml", "No calibrated region exists for this key"
+            )
+        if fingertip is None:
+            return HybridPrediction(
+                "Unknown", confidence, None, "ml", "Predicted fingertip is not currently visible"
+            )
+
+        width, height = frame_size
+        dx = (fingertip[0] - target[0]) * width
+        dy = (fingertip[1] - target[1]) * height
+        distance_px = math.hypot(dx, dy)
+        if distance_px > self.spatial_threshold_px:
+            return HybridPrediction(
+                "Unknown",
+                confidence,
+                distance_px,
+                "ml",
+                "Predicted fingertip is outside the calibrated key region",
+            )
+
+        return HybridPrediction(label, confidence, distance_px, "ml", "Accepted")
 
 
 class KinematicsEngine:
@@ -275,7 +355,10 @@ class KinematicsEngine:
                     timestamp_ns - track.timestamp_ns
                 ) / NS_PER_SECOND
                 tip_velocity_image: dict[str, np.ndarray] = {}
+                tip_velocity_local: dict[str, np.ndarray] = {}
                 downward_velocity: dict[str, float] = {}
+                pip_flexion_rate: dict[str, float] = {}
+                dip_flexion_rate: dict[str, float] = {}
                 flexion_rate: dict[str, float] = {}
 
                 for name, tip_index in TIP_INDICES.items():
@@ -285,17 +368,20 @@ class KinematicsEngine:
                             filtered_image[tip_index, :2]
                             - track.image_landmarks[tip_index, :2]
                         ) / dt
-                        bend_rate = max(
-                            0.0,
-                            (flexion[name] - (track.flexion or {}).get(name, flexion[name])) / dt,
-                        )
+                        previous_flexion = (track.flexion or {}).get(name, flexion[name])
+                        pip_rate = (flexion[name][0] - previous_flexion[0]) / dt
+                        dip_rate = (flexion[name][1] - previous_flexion[1]) / dt
                     else:
                         local_velocity = np.zeros(3)
                         image_velocity = np.zeros(2)
-                        bend_rate = 0.0
+                        pip_rate = 0.0
+                        dip_rate = 0.0
                     tip_velocity_image[name] = image_velocity
+                    tip_velocity_local[name] = local_velocity
                     downward_velocity[name] = max(0.0, -float(local_velocity[2]))
-                    flexion_rate[name] = bend_rate
+                    pip_flexion_rate[name] = pip_rate
+                    dip_flexion_rate[name] = dip_rate
+                    flexion_rate[name] = max(0.0, pip_rate + dip_rate)
 
                 depths = np.array([-local[index, 2] for index in TIP_INDICES.values()])
                 depth_center = float(np.median(depths))
@@ -322,7 +408,10 @@ class KinematicsEngine:
                     local,
                     palm_basis[:, 2].copy(),
                     tip_velocity_image,
+                    tip_velocity_local,
                     downward_velocity,
+                    pip_flexion_rate,
+                    dip_flexion_rate,
                     flexion_rate,
                     scores,
                     active_finger,
@@ -344,6 +433,24 @@ class KinematicsEngine:
     def snapshot(self) -> KinematicsSnapshot:
         with self._lock:
             return self._latest
+
+    def history_window(
+        self,
+        center_timestamp_ns: int,
+        *,
+        before_ns: int = 50_000_000,
+        after_ns: int = 50_000_000,
+    ) -> tuple[KinematicsSnapshot, ...]:
+        """Return an immutable copy of inference results around a keydown."""
+
+        start = center_timestamp_ns - before_ns
+        end = center_timestamp_ns + after_ns
+        with self._lock:
+            return tuple(
+                KinematicsSnapshot(timestamp_ns, hands, None)
+                for timestamp_ns, hands in self._history
+                if start <= timestamp_ns <= end
+            )
 
 
 class HandInferencePipeline:

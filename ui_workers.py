@@ -19,9 +19,29 @@ prepare_qt_runtime()
 
 from PySide6.QtCore import QThread, Signal
 
+from calibration_collector import (
+    DEFAULT_DATA_PATH,
+    DEFAULT_SEQUENCE,
+    GuidedCalibrationCollector,
+    extract_feature_window,
+)
+from finger_classifier import DEFAULT_MODEL_PATH as DEFAULT_FINGER_MODEL_PATH
+from finger_classifier import FingerClassifier, train_model
 from keyboard_layouts import expected_finger
-from kinematics import HandInferencePipeline, KinematicsSnapshot, draw_hand_overlay
-from mvp_sync import FramePacket, KeyboardCollector, RollingRate
+from kinematics import (
+    HandInferencePipeline,
+    HybridDecisionEngine,
+    KinematicsSnapshot,
+    draw_hand_overlay,
+)
+from mvp_sync import (
+    CAMERA_READ_TIMEOUT_S,
+    MAX_CONSECUTIVE_READ_FAILURES,
+    FramePacket,
+    KeyboardCollector,
+    RollingRate,
+    TimedCaptureReader,
+)
 from posture import PostureMonitor, PostureStatus
 
 
@@ -121,6 +141,7 @@ class _PendingKey:
 
 class CameraThread(QThread):
     ready = Signal(str)
+    camera_error = Signal(str)
     failed = Signal(str)
 
     BACKENDS = {"dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF}
@@ -155,56 +176,114 @@ class CameraThread(QThread):
             values.update(changes)
             self._status = CameraStatus(**values)
 
-    def run(self) -> None:
-        capture = None
-        rate = RollingRate()
-        sequence = 0
-        try:
-            backend_id = self.BACKENDS[self.config.backend]
-            capture = cv2.VideoCapture(self.config.camera_idx, backend_id)
-            if not capture.isOpened():
-                raise RuntimeError(
-                    f"Could not open camera {self.config.camera_idx} with {self.config.backend.upper()}"
-                )
-            capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
-            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
-            capture.set(cv2.CAP_PROP_FPS, self.config.fps)
-            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    def _increment_read_failures(self) -> None:
+        with self._state_lock:
+            self._status = CameraStatus(
+                self._status.backend,
+                self._status.width,
+                self._status.height,
+                self._status.capture_fps,
+                self._status.read_failures + 1,
+                self._status.error,
+            )
 
-            consecutive_failures = 0
-            announced = False
-            while not self._stop_event.is_set() and not self.isInterruptionRequested():
-                started_ns = time.perf_counter_ns()
-                ok, frame = capture.read()
-                finished_ns = time.perf_counter_ns()
-                if not ok or frame is None:
-                    consecutive_failures += 1
-                    self._set_status(read_failures=self._status.read_failures + 1)
-                    if consecutive_failures >= 30:
-                        raise RuntimeError("Camera stopped returning frames")
-                    self.msleep(5)
+    def _backend_candidates(self) -> list[tuple[str, int]]:
+        order = (
+            ("dshow", "msmf")
+            if self.config.backend == "dshow"
+            else ("msmf", "dshow")
+        )
+        return [(name, self.BACKENDS[name]) for name in order]
+
+    def _configure_camera(self, capture: cv2.VideoCapture) -> None:
+        # Windows drivers negotiate the compressed media type from this order.
+        capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
+        capture.set(cv2.CAP_PROP_FPS, self.config.fps)
+
+    def run(self) -> None:
+        sequence = 0
+        failures: list[str] = []
+        try:
+            candidates = self._backend_candidates()
+            for candidate_index, (name, backend_id) in enumerate(candidates):
+                if self._stop_event.is_set() or self.isInterruptionRequested():
+                    return
+
+                self._set_status(
+                    backend=name.upper(), width=0, height=0, capture_fps=0.0, error=None
+                )
+                capture = cv2.VideoCapture(self.config.camera_idx, backend_id)
+                if not capture.isOpened():
+                    message = f"{name.upper()} could not open camera {self.config.camera_idx}"
+                    failures.append(message)
+                    capture.release()
+                    if candidate_index + 1 < len(candidates):
+                        next_name = candidates[candidate_index + 1][0].upper()
+                        self.camera_error.emit(f"{message}; trying {next_name}")
                     continue
 
+                self._configure_camera(capture)
+                reader = TimedCaptureReader(capture)
+                reader.start()
+                rate = RollingRate()
                 consecutive_failures = 0
-                timestamp_ns = (started_ns + finished_ns) // 2
-                rate.tick(timestamp_ns)
-                height, width = frame.shape[:2]
-                self._set_status(width=width, height=height, capture_fps=rate.value())
-                self.output.publish(FramePacket(sequence, timestamp_ns, frame))
-                sequence += 1
-                if not announced:
-                    announced = True
-                    self.ready.emit(
-                        f"Camera {self.config.camera_idx} · {self.config.backend.upper()} · {width}×{height}"
-                    )
+                announced = False
+                failure_reason = ""
+                try:
+                    while not self._stop_event.is_set() and not self.isInterruptionRequested():
+                        result = reader.get(CAMERA_READ_TIMEOUT_S)
+                        if result is None or not result.ok or result.frame is None:
+                            consecutive_failures += 1
+                            self._increment_read_failures()
+                            if consecutive_failures >= MAX_CONSECUTIVE_READ_FAILURES:
+                                failure_reason = (
+                                    f"{name.upper()} opened camera {self.config.camera_idx} but "
+                                    f"returned no frame for {MAX_CONSECUTIVE_READ_FAILURES} "
+                                    "consecutive reads/timeouts"
+                                )
+                                break
+                            continue
+
+                        consecutive_failures = 0
+                        frame = result.frame
+                        rate.tick(result.timestamp_ns)
+                        height, width = frame.shape[:2]
+                        self._set_status(
+                            backend=name.upper(),
+                            width=width,
+                            height=height,
+                            capture_fps=rate.value(),
+                        )
+                        self.output.publish(FramePacket(sequence, result.timestamp_ns, frame))
+                        sequence += 1
+                        if not announced:
+                            announced = True
+                            self.ready.emit(
+                                f"Camera {self.config.camera_idx} · {name.upper()} · {width}×{height}"
+                            )
+                finally:
+                    clean_close = reader.close()
+
+                if self._stop_event.is_set() or self.isInterruptionRequested():
+                    return
+                if not clean_close:
+                    failure_reason += " (backend reader did not stop cleanly)"
+                failures.append(failure_reason or f"{name.upper()} capture ended")
+                if candidate_index + 1 < len(candidates):
+                    next_name = candidates[candidate_index + 1][0].upper()
+                    self.camera_error.emit(f"{failures[-1]}; trying {next_name}")
+
+            detail = "; ".join(failures) if failures else "capture cancelled"
+            raise RuntimeError(
+                f"Unable to acquire camera {self.config.camera_idx}: {detail}"
+            )
         except BaseException as exc:
             message = f"Camera error: {exc}"
             self._set_status(error=message)
             self.failed.emit(message)
-        finally:
-            if capture is not None:
-                capture.release()
 
 
 class KeyboardThread(QThread):
@@ -244,10 +323,30 @@ class KeyboardThread(QThread):
             self.collector.stop()
 
 
+class ModelTrainingThread(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, data_path: Path, model_path: Path) -> None:
+        super().__init__()
+        self.setObjectName("finger-model-training")
+        self.data_path = Path(data_path)
+        self.model_path = Path(model_path)
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(train_model(self.data_path, self.model_path))
+        except BaseException as exc:
+            self.failed.emit(f"Model training failed: {exc}")
+
+
 class VisionThread(QThread):
     ready = Signal(str)
     failed = Signal(str)
     keystroke_ready = Signal(object)
+    calibration_progress = Signal(object)
+    calibration_finished = Signal(str)
+    model_status = Signal(str)
 
     def __init__(
         self,
@@ -260,6 +359,9 @@ class VisionThread(QThread):
         processing_height: int = 720,
         inference_fps: float = 30.0,
         keyboard_layout: str,
+        calibration_path: Path = DEFAULT_DATA_PATH,
+        finger_model_path: Path = DEFAULT_FINGER_MODEL_PATH,
+        spatial_threshold_px: float = 120.0,
     ) -> None:
         super().__init__()
         self.setObjectName("vision-compositor")
@@ -271,7 +373,25 @@ class VisionThread(QThread):
         self.processing_height = processing_height
         self.inference_fps = inference_fps
         self.keyboard_layout = keyboard_layout
+        self.calibration_path = Path(calibration_path)
+        self.finger_model_path = Path(finger_model_path)
+        self.spatial_threshold_px = spatial_threshold_px
         self._stop_event = threading.Event()
+        self._control_lock = threading.Lock()
+        self._calibration_command: tuple[str, str, int] | None = None
+        self._reload_model = False
+
+    def start_calibration(self, sequence: str = DEFAULT_SEQUENCE, repeats: int = 5) -> None:
+        with self._control_lock:
+            self._calibration_command = ("start", sequence, repeats)
+
+    def cancel_calibration(self) -> None:
+        with self._control_lock:
+            self._calibration_command = ("cancel", "", 0)
+
+    def request_model_reload(self) -> None:
+        with self._control_lock:
+            self._reload_model = True
 
     def stop(self) -> None:
         self.requestInterruption()
@@ -318,6 +438,7 @@ class VisionThread(QThread):
         pipeline: HandInferencePipeline,
         pending: list[_PendingKey],
         wall_clock_offset_ns: int,
+        collector: GuidedCalibrationCollector,
     ) -> float | None:
         latest_delta: float | None = None
         while True:
@@ -331,6 +452,9 @@ class VisionThread(QThread):
             if associated is not None:
                 latest_delta = (event.timestamp_ns - associated.timestamp_ns) / 1_000_000
             pipeline.engine.register_keypress(event.timestamp_ns, event.label)
+            calibration_update = collector.handle_keypress(event.timestamp_ns, event.label)
+            if calibration_update is not None:
+                self.calibration_progress.emit(calibration_update)
             wall_ns = event.timestamp_ns + wall_clock_offset_ns
             timestamp = datetime.fromtimestamp(wall_ns / 1_000_000_000).strftime("%H:%M:%S.%f")[:-3]
             pending.append(
@@ -342,9 +466,41 @@ class VisionThread(QThread):
                 )
             )
 
+    def _handle_control_commands(
+        self,
+        collector: GuidedCalibrationCollector,
+        decision: HybridDecisionEngine,
+    ) -> None:
+        with self._control_lock:
+            command = self._calibration_command
+            self._calibration_command = None
+            reload_model = self._reload_model
+            self._reload_model = False
+
+        if command is not None:
+            action, sequence, repeats = command
+            update = (
+                collector.start(sequence, repeats)
+                if action == "start"
+                else collector.cancel()
+            )
+            self.calibration_progress.emit(update)
+
+        if reload_model:
+            try:
+                decision.classifier = FingerClassifier.load(self.finger_model_path)
+                self.model_status.emit(f"Loaded {self.finger_model_path.name}")
+            except BaseException as exc:
+                decision.classifier = None
+                self.model_status.emit(f"Finger model unavailable: {exc}")
+
     def run(self) -> None:
         pipeline: HandInferencePipeline | None = None
         posture = PostureMonitor()
+        collector = GuidedCalibrationCollector(
+            self.calibration_path, keyboard_layout=self.keyboard_layout
+        )
+        decision = HybridDecisionEngine(spatial_threshold_px=self.spatial_threshold_px)
         pending: list[_PendingKey] = []
         last_frame_sequence = -1
         last_analysis_timestamp = -1
@@ -356,10 +512,19 @@ class VisionThread(QThread):
                 num_hands=2,
                 max_fps=self.inference_fps,
             )
+            if self.finger_model_path.exists():
+                try:
+                    decision.classifier = FingerClassifier.load(self.finger_model_path)
+                    self.model_status.emit(f"Loaded {self.finger_model_path.name}")
+                except BaseException as exc:
+                    self.model_status.emit(f"Finger model unavailable: {exc}")
             self.ready.emit("MediaPipe CPU pipeline ready")
 
             while not self._stop_event.is_set() and not self.isInterruptionRequested():
-                new_delta = self._drain_keys(pipeline, pending, wall_clock_offset_ns)
+                self._handle_control_commands(collector, decision)
+                new_delta = self._drain_keys(
+                    pipeline, pending, wall_clock_offset_ns, collector
+                )
                 if new_delta is not None:
                     latest_key_delta = new_delta
 
@@ -374,15 +539,37 @@ class VisionThread(QThread):
                 snapshot = pipeline.engine.snapshot()
                 self._update_pending(pending, snapshot)
 
+                calibration_update = collector.process_ready(
+                    pipeline.engine, packet.timestamp_ns
+                )
+                if calibration_update is not None:
+                    self.calibration_progress.emit(calibration_update)
+                    if calibration_update.complete:
+                        self.calibration_finished.emit(str(self.calibration_path))
+
                 for item in list(pending):
                     if packet.timestamp_ns - item.timestamp_ns >= 110_000_000:
+                        observed = item.observed
+                        confidence = item.confidence
+                        window = extract_feature_window(pipeline.engine, item.timestamp_ns)
+                        if window is not None and decision.classifier is not None:
+                            result = decision.classify(
+                                window.values,
+                                item.key,
+                                window.fingertip_positions,
+                                (display.shape[1], display.shape[0]),
+                                heuristic_label=item.observed,
+                                heuristic_confidence=item.confidence,
+                            )
+                            observed = result.label
+                            confidence = result.confidence
                         self.keystroke_ready.emit(
                             KeystrokeRecord(
                                 item.wall_timestamp,
                                 item.key,
                                 item.expected,
-                                item.observed,
-                                item.confidence,
+                                observed,
+                                confidence,
                             )
                         )
                         pending.remove(item)

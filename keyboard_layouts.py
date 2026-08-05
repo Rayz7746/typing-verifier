@@ -44,7 +44,9 @@ def normalize_key_label(label: str) -> str:
     if len(label) >= 3 and label[0] == label[-1] == "'":
         value = label[1:-1]
         if len(value) == 1:
-            return value.lower()
+            return "space" if value == " " else value.lower()
+    if label == " ":
+        return "space"
     return label.lower()
 
 

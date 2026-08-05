@@ -24,6 +24,8 @@ WINDOW_NAME: Final = "Touch-Typing Verifier - Synchronization MVP"
 KEY_QUEUE_SIZE: Final = 256
 NS_PER_SECOND: Final = 1_000_000_000
 NS_PER_MILLISECOND: Final = 1_000_000
+CAMERA_READ_TIMEOUT_S: Final = 0.100
+MAX_CONSECUTIVE_READ_FAILURES: Final = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +41,83 @@ class FramePacket:
     sequence: int
     timestamp_ns: int
     image: object
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureRead:
+    ok: bool
+    timestamp_ns: int
+    frame: object | None
+
+
+class TimedCaptureReader:
+    """Isolate a potentially blocking OpenCV read behind a bounded mailbox."""
+
+    def __init__(self, capture: cv2.VideoCapture) -> None:
+        self.capture = capture
+        self._stop_event = threading.Event()
+        self._results: queue.Queue[CaptureRead] = queue.Queue(maxsize=1)
+        self._thread = threading.Thread(
+            target=self._read_loop,
+            name="opencv-camera-read",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def get(self, timeout_s: float = CAMERA_READ_TIMEOUT_S) -> CaptureRead | None:
+        try:
+            return self._results.get(timeout=timeout_s)
+        except queue.Empty:
+            return None
+
+    def _publish(self, result: CaptureRead) -> None:
+        try:
+            self._results.put_nowait(result)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._results.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._results.put_nowait(result)
+        except queue.Full:
+            pass
+
+    def _read_loop(self) -> None:
+        while not self._stop_event.is_set():
+            started_ns = time.perf_counter_ns()
+            try:
+                ok, frame = self.capture.read()
+            except BaseException:
+                ok, frame = False, None
+            finished_ns = time.perf_counter_ns()
+            self._publish(
+                CaptureRead(
+                    bool(ok and frame is not None),
+                    (started_ns + finished_ns) // 2,
+                    frame,
+                )
+            )
+            if not ok or frame is None:
+                time.sleep(0.005)
+
+    def close(self, timeout_s: float = 0.75) -> bool:
+        """Request shutdown without allowing a stuck backend to freeze its owner."""
+
+        self._stop_event.set()
+        release_thread = threading.Thread(
+            target=self.capture.release,
+            name="opencv-camera-release",
+            daemon=True,
+        )
+        release_thread.start()
+        release_thread.join(timeout=timeout_s)
+        self._thread.join(timeout=timeout_s)
+        return not self._thread.is_alive() and not release_thread.is_alive()
 
 
 class LatestFrameSlot:
@@ -128,103 +207,89 @@ class CaptureWorker(threading.Thread):
         self._error: str | None = None
 
     def _backend_candidates(self) -> list[tuple[str, int]]:
-        if self.backend == "auto":
+        if self.backend in ("auto", "dshow"):
             return [(name, self.BACKENDS[name]) for name in ("dshow", "msmf")]
-        return [(self.backend, self.BACKENDS[self.backend])]
+        return [(name, self.BACKENDS[name]) for name in ("msmf", "dshow")]
 
-    def _open_camera(self) -> tuple[cv2.VideoCapture | None, FramePacket | None]:
+    def _configure_camera(self, capture: cv2.VideoCapture) -> None:
+        # Order matters for Windows USB camera media-type negotiation.
+        capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        capture.set(cv2.CAP_PROP_FPS, self.fps)
+
+    def run(self) -> None:
         failures: list[str] = []
         sequence = 0
 
-        for name, backend_id in self._backend_candidates():
-            if self.stop_event.is_set():
-                break
-
-            print(f"Opening camera {self.camera_idx} with {name.upper()}...")
-            capture = cv2.VideoCapture(self.camera_idx, backend_id)
-            if not capture.isOpened():
-                failures.append(f"{name.upper()}: open failed")
-                capture.release()
-                continue
-
-            # Drivers may ignore individual properties; accepted values are
-            # reflected by the actual frames and OSD rather than assumed here.
-            capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            capture.set(cv2.CAP_PROP_FPS, self.fps)
-            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-            read_started_ns = time.perf_counter_ns()
-            ok, frame = capture.read()
-            read_finished_ns = time.perf_counter_ns()
-            if not ok or frame is None:
-                failures.append(f"{name.upper()}: opened but first read failed")
-                capture.release()
-                continue
-
-            timestamp_ns = (read_started_ns + read_finished_ns) // 2
-            packet = FramePacket(sequence, timestamp_ns, frame)
-            with self._state_lock:
-                self._selected_backend = name.upper()
-            print(
-                f"Using {name.upper()}: {frame.shape[1]}x{frame.shape[0]} "
-                f"(requested {self.width}x{self.height} @ {self.fps:g} FPS)"
-            )
-            return capture, packet
-
-        detail = "; ".join(failures) if failures else "capture cancelled"
-        with self._state_lock:
-            self._error = f"Unable to acquire camera {self.camera_idx}: {detail}"
-        return None, None
-
-    def run(self) -> None:
-        capture: cv2.VideoCapture | None = None
-        rate = RollingRate()
-        sequence = 0
-
         try:
-            capture, first_packet = self._open_camera()
-            if capture is None or first_packet is None:
-                return
-
-            self.slot.publish(first_packet)
-            rate.tick(first_packet.timestamp_ns)
-            sequence = first_packet.sequence + 1
-            self.ready.set()
-
-            consecutive_failures = 0
-            while not self.stop_event.is_set():
-                read_started_ns = time.perf_counter_ns()
-                ok, frame = capture.read()
-                read_finished_ns = time.perf_counter_ns()
-
-                if not ok or frame is None:
-                    consecutive_failures += 1
-                    with self._state_lock:
-                        self._read_failures += 1
-                    if consecutive_failures >= 30:
-                        with self._state_lock:
-                            self._error = "Camera stopped returning frames."
-                        self.stop_event.set()
-                        break
-                    time.sleep(0.005)
+            for name, backend_id in self._backend_candidates():
+                if self.stop_event.is_set():
+                    break
+                print(f"Opening camera {self.camera_idx} with {name.upper()}...")
+                capture = cv2.VideoCapture(self.camera_idx, backend_id)
+                if not capture.isOpened():
+                    failures.append(f"{name.upper()}: open failed")
+                    capture.release()
                     continue
 
+                self._configure_camera(capture)
+                reader = TimedCaptureReader(capture)
+                reader.start()
+                rate = RollingRate()
                 consecutive_failures = 0
-                timestamp_ns = (read_started_ns + read_finished_ns) // 2
-                self.slot.publish(FramePacket(sequence, timestamp_ns, frame))
-                sequence += 1
-                rate.tick(timestamp_ns)
-                with self._state_lock:
-                    self._capture_fps = rate.value()
+                announced = False
+                failure_reason = ""
+                try:
+                    while not self.stop_event.is_set():
+                        result = reader.get(CAMERA_READ_TIMEOUT_S)
+                        if result is None or not result.ok or result.frame is None:
+                            consecutive_failures += 1
+                            with self._state_lock:
+                                self._read_failures += 1
+                            if consecutive_failures >= MAX_CONSECUTIVE_READ_FAILURES:
+                                failure_reason = (
+                                    f"{name.upper()}: no frame after "
+                                    f"{MAX_CONSECUTIVE_READ_FAILURES} consecutive reads/timeouts"
+                                )
+                                break
+                            continue
+
+                        consecutive_failures = 0
+                        frame = result.frame
+                        self.slot.publish(FramePacket(sequence, result.timestamp_ns, frame))
+                        sequence += 1
+                        rate.tick(result.timestamp_ns)
+                        with self._state_lock:
+                            self._selected_backend = name.upper()
+                            self._capture_fps = rate.value()
+                        if not announced:
+                            announced = True
+                            self.ready.set()
+                            print(
+                                f"Using {name.upper()}: {frame.shape[1]}x{frame.shape[0]} "
+                                f"(requested {self.width}x{self.height} @ {self.fps:g} FPS)"
+                            )
+                finally:
+                    clean_close = reader.close()
+
+                if self.stop_event.is_set():
+                    return
+                if not clean_close:
+                    failure_reason += " (backend reader did not stop cleanly)"
+                failures.append(failure_reason or f"{name.upper()}: capture ended")
+                print(f"{failures[-1]}; trying next backend...", file=sys.stderr)
+
+            detail = "; ".join(failures) if failures else "capture cancelled"
+            with self._state_lock:
+                self._error = f"Unable to acquire camera {self.camera_idx}: {detail}"
+            self.stop_event.set()
         except BaseException as exc:
             with self._state_lock:
                 self._error = f"Capture thread failed: {exc}"
             self.stop_event.set()
         finally:
-            if capture is not None:
-                capture.release()
             self.ready.set()
 
     def snapshot(self) -> tuple[str, float, int, str | None]:

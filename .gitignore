@@ -3,3 +3,6 @@ __pycache__/
 *.py[cod]
 models/*.task
 models/*.part
+calibration_data.json
+finger_model.pkl
+finger_model.pkl.part
