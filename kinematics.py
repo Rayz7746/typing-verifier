@@ -93,6 +93,7 @@ class HandAnalysis:
     timestamp_ns: int
     image_landmarks: np.ndarray
     local_landmarks: np.ndarray
+    palm_normal: np.ndarray
     tip_velocity_image: dict[str, np.ndarray]
     downward_velocity: dict[str, float]
     flexion_rate: dict[str, float]
@@ -139,9 +140,7 @@ def _unit(vector: np.ndarray) -> np.ndarray:
     return vector / norm
 
 
-def palm_local_coordinates(world_landmarks: np.ndarray) -> np.ndarray:
-    """Return landmarks in an anatomical palm basis, scaled by palm width."""
-
+def _palm_local_frame(world_landmarks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     points = np.asarray(world_landmarks, dtype=np.float64)
     palm_width = float(np.linalg.norm(points[5] - points[17]))
     if palm_width < 1e-6:
@@ -158,7 +157,14 @@ def palm_local_coordinates(world_landmarks: np.ndarray) -> np.ndarray:
     if float(np.mean(relative[list(TIP_INDICES.values())] @ z_axis)) > 0.0:
         z_axis = -z_axis
     basis = np.column_stack((x_axis, y_axis, z_axis))
-    return (relative @ basis) / palm_width
+    return (relative @ basis) / palm_width, basis
+
+
+def palm_local_coordinates(world_landmarks: np.ndarray) -> np.ndarray:
+    """Return landmarks in an anatomical palm basis, scaled by palm width."""
+
+    local, _basis = _palm_local_frame(world_landmarks)
+    return local
 
 
 def _joint_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
@@ -257,7 +263,7 @@ class KinematicsEngine:
                 filtered_world = track.world_filter.filter(world_points, time_s)
 
                 try:
-                    local = palm_local_coordinates(filtered_world)
+                    local, palm_basis = _palm_local_frame(filtered_world)
                     flexion = {
                         name: _finger_flexion(local, joints)
                         for name, joints in FINGER_JOINTS.items()
@@ -314,6 +320,7 @@ class KinematicsEngine:
                     timestamp_ns,
                     filtered_image,
                     local,
+                    palm_basis[:, 2].copy(),
                     tip_velocity_image,
                     downward_velocity,
                     flexion_rate,
