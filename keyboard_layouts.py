@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+
 
 US_ANSI_QWERTY = "US ANSI QWERTY"
 
@@ -34,6 +36,13 @@ def _build_us_ansi() -> dict[str, str]:
             "enter": "Right pinky",
         }
     )
+    shifted = {
+        "~": "`", "!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
+        "^": "6", "&": "7", "*": "8", "(": "9", ")": "0", "_": "-",
+        "+": "=", "{": "[", "}": "]", "|": "\\", ":": ";", '"': "'",
+        "<": ",", ">": ".", "?": "/",
+    }
+    mapping.update({alias: mapping[target] for alias, target in shifted.items()})
     return mapping
 
 
@@ -41,9 +50,12 @@ LAYOUTS = {US_ANSI_QWERTY: _build_us_ansi()}
 
 
 def normalize_key_label(label: str) -> str:
-    if len(label) >= 3 and label[0] == label[-1] == "'":
-        value = label[1:-1]
-        if len(value) == 1:
+    if len(label) >= 3 and label[0] == label[-1] and label[0] in ("'", '"'):
+        try:
+            value = ast.literal_eval(label)
+        except (SyntaxError, ValueError):
+            value = None
+        if isinstance(value, str) and len(value) == 1:
             return "space" if value == " " else value.lower()
     if label == " ":
         return "space"

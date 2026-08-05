@@ -14,12 +14,20 @@ from keyboard_layouts import US_ANSI_QWERTY, expected_finger, normalize_key_labe
 from kinematics import FINGER_NAMES, TIP_INDICES, KinematicsEngine, KinematicsSnapshot
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 WINDOW_OFFSETS_MS = (-50, -25, 0, 25, 50)
 HAND_ORDER = ("Left", "Right")
 FEATURES_PER_FINGER = 9
+FEATURE_SCALES = np.asarray((4.0, 4.0, 4.0, 20.0, 20.0, 20.0, 50.0, 50.0, 1.0))
 DEFAULT_SEQUENCE = "asdf jkl;"
 DEFAULT_DATA_PATH = Path(__file__).resolve().with_name("calibration_data.json")
+CALIBRATION_SETS = {
+    "Home Row": "asdf jkl;",
+    "Top Row": "qwertyuiop",
+    "Bottom Row": "zxcvbnm",
+    "Numbers": "1234567890",
+    "Full Keyboard": "qwertyuiopasdfghjkl;zxcvbnm 1234567890",
+}
 
 
 def feature_names() -> list[str]:
@@ -47,6 +55,16 @@ def feature_names() -> list[str]:
 FEATURE_NAMES = feature_names()
 
 
+def normalize_feature_vector(values: list[float] | np.ndarray) -> np.ndarray:
+    """Bound canonical kinematics to stable ranges shared by train and predict."""
+
+    matrix = np.asarray(values, dtype=np.float32).reshape(-1, FEATURES_PER_FINGER)
+    matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+    matrix[:, :8] = np.clip(matrix[:, :8] / FEATURE_SCALES[:8], -1.0, 1.0)
+    matrix[:, 8] = np.clip(matrix[:, 8], 0.0, 1.0)
+    return matrix.reshape(-1)
+
+
 @dataclass(frozen=True, slots=True)
 class FeatureWindow:
     center_timestamp_ns: int
@@ -67,6 +85,11 @@ class CalibrationProgress:
     waiting_for_window: bool
     complete: bool
     message: str
+    round_index: int = 0
+    rounds: int = 0
+    target_sample_count: int = 0
+    dataset_samples: int = 0
+    set_name: str = ""
 
 
 @dataclass(slots=True)
@@ -140,7 +163,7 @@ def extract_feature_window(
     )
     if score < 0.28:
         label = "Unknown"
-    vector = np.asarray(values, dtype=np.float32)
+    vector = normalize_feature_vector(values)
     if vector.size != len(FEATURE_NAMES):
         raise RuntimeError(f"feature schema mismatch: {vector.size} != {len(FEATURE_NAMES)}")
     return FeatureWindow(
@@ -165,10 +188,16 @@ class GuidedCalibrationCollector:
         self.output_path = Path(output_path)
         self.keyboard_layout = keyboard_layout
         self._prompts: list[str] = []
+        self._sequence = ""
+        self._rounds = 0
+        self._set_name = "Custom"
         self._index = 0
         self._rejected = 0
         self._pending: _PendingPress | None = None
         self._samples: list[dict] = []
+        self._existing_samples: list[dict] = []
+        self._existing_sessions: list[dict] = []
+        self._sample_counts: dict[str, int] = {}
         self._started_wall_ns = 0
         self._active = False
 
@@ -176,13 +205,35 @@ class GuidedCalibrationCollector:
     def active(self) -> bool:
         return self._active
 
-    def start(self, sequence: str = DEFAULT_SEQUENCE, repeats: int = 5) -> CalibrationProgress:
+    def start(
+        self,
+        sequence: str = DEFAULT_SEQUENCE,
+        repeats: int = 5,
+        set_name: str = "Custom",
+    ) -> CalibrationProgress:
         if not sequence or repeats < 1:
             raise ValueError("sequence must be non-empty and repeats must be positive")
+        self._sequence = sequence
+        self._rounds = repeats
+        self._set_name = set_name
         self._prompts = list(sequence) * repeats
         self._index = self._rejected = 0
         self._pending = None
         self._samples = []
+        self._sample_counts = {}
+        self._existing_samples = []
+        self._existing_sessions = []
+        if self.output_path.exists():
+            try:
+                existing = json.loads(self.output_path.read_text(encoding="utf-8"))
+                if (
+                    existing.get("schema_version") == SCHEMA_VERSION
+                    and existing.get("feature_names") == FEATURE_NAMES
+                ):
+                    self._existing_samples = list(existing.get("samples", []))
+                    self._existing_sessions = list(existing.get("sessions", []))
+            except (OSError, ValueError, TypeError):
+                pass
         self._started_wall_ns = time.time_ns()
         self._active = True
         return self.progress("Type the highlighted key")
@@ -194,6 +245,12 @@ class GuidedCalibrationCollector:
 
     def progress(self, message: str = "") -> CalibrationProgress:
         current = "" if self._index >= len(self._prompts) else self._prompts[self._index]
+        round_index = (
+            0
+            if not self._sequence or self._index >= len(self._prompts)
+            else self._index // len(self._sequence) + 1
+        )
+        normalized_current = "space" if current == " " else current.lower()
         return CalibrationProgress(
             self._index,
             len(self._prompts),
@@ -203,6 +260,11 @@ class GuidedCalibrationCollector:
             self._pending is not None,
             bool(self._prompts) and self._index >= len(self._prompts),
             message,
+            round_index,
+            self._rounds,
+            self._sample_counts.get(normalized_current, 0),
+            len(self._existing_samples) + len(self._samples),
+            self._set_name,
         )
 
     def handle_keypress(self, timestamp_ns: int, label: str) -> CalibrationProgress | None:
@@ -259,6 +321,7 @@ class GuidedCalibrationCollector:
                 "target_fingertip_xy": list(target_point),
             }
         )
+        self._sample_counts[pending.key] = self._sample_counts.get(pending.key, 0) + 1
         self._index += 1
         if self._index >= len(self._prompts):
             self._active = False
@@ -267,13 +330,27 @@ class GuidedCalibrationCollector:
         return self.progress("Sample accepted")
 
     def save(self) -> None:
+        session = {
+            "set_name": self._set_name,
+            "sequence": self._sequence,
+            "rounds": self._rounds,
+            "accepted_samples": len(self._samples),
+            "completed_unix_ns": time.time_ns(),
+        }
         payload = {
             "schema_version": SCHEMA_VERSION,
             "created_unix_ns": self._started_wall_ns,
             "keyboard_layout": self.keyboard_layout,
             "window_offsets_ms": list(WINDOW_OFFSETS_MS),
+            "coordinate_space": "palm_local_normalized_v2",
+            "feature_scaling": {
+                "position_palm_widths": 4.0,
+                "velocity_palm_widths_per_second": 20.0,
+                "flexion_radians_per_second": 50.0,
+            },
             "feature_names": FEATURE_NAMES,
-            "samples": self._samples,
+            "sessions": [*self._existing_sessions, session],
+            "samples": [*self._existing_samples, *self._samples],
         }
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.output_path.with_suffix(self.output_path.suffix + ".part")

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 import time
 from collections import deque
@@ -12,10 +14,14 @@ from qt_bootstrap import prepare_qt_runtime
 
 prepare_qt_runtime()
 
-from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QCloseEvent, QImage, QPainter
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QCloseEvent, QImage, QKeyEvent, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QAbstractSlider,
+    QAbstractSpinBox,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFormLayout,
@@ -25,10 +31,13 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
@@ -37,17 +46,24 @@ from PySide6.QtWidgets import (
 )
 
 from calibration_collector import (
+    CALIBRATION_SETS,
     DEFAULT_DATA_PATH as DEFAULT_CALIBRATION_PATH,
-    DEFAULT_SEQUENCE,
     CalibrationProgress,
 )
 from fetch_model import DEFAULT_MODEL_PATH, ensure_model
 from finger_classifier import DEFAULT_MODEL_PATH as DEFAULT_FINGER_MODEL_PATH
 from finger_classifier import TrainingResult
+from keyboard_geometry import (
+    KeyboardPlane,
+    keyboard_roi_from_points,
+    normalize_plane_points,
+)
 from keyboard_layouts import LAYOUTS, US_ANSI_QWERTY
+from kinematics import normalized_roi
 from ui_workers import (
     CameraConfig,
     CameraThread,
+    HighResolutionFrameRingBuffer,
     KeyboardThread,
     KeystrokeRecord,
     LatestValueSlot,
@@ -56,6 +72,9 @@ from ui_workers import (
     VisionTelemetry,
     VisionThread,
 )
+
+
+DEFAULT_APP_CONFIG_PATH = Path(__file__).resolve().with_name("app_config.json")
 
 
 APP_STYLE = """
@@ -142,16 +161,49 @@ QLabel#postureBanner {
 """
 
 
+def disable_keyboard_focus(root: QWidget) -> None:
+    """Keep native Qt controls mouse-only so typing belongs exclusively to pynput."""
+
+    root.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    widgets = root.findChildren(QWidget)
+    for widget in widgets:
+        widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        if isinstance(widget, QPushButton):
+            widget.setAutoDefault(False)
+            widget.setDefault(False)
+        if isinstance(widget, QComboBox):
+            widget.view().setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        if isinstance(widget, QAbstractSpinBox):
+            widget.lineEdit().setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        if isinstance(widget, (QAbstractItemView, QAbstractSlider)):
+            widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+
 class VideoWidget(QWidget):
     """Zero-copy QImage view backed by the current NumPy frame."""
 
+    roi_selected = Signal(object)
+    plane_selected = Signal(object)
+    plane_progress = Signal(int, str)
+
     def __init__(self) -> None:
         super().__init__()
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setMinimumSize(640, 360)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._packet: RenderedFrame | None = None
         self._paint_times: deque[int] = deque()
         self._render_fps = 0.0
+        self._image_rect = QRect()
+        self._keyboard_roi: tuple[float, float, float, float] | None = None
+        self._selecting_roi = False
+        self._selecting_plane = False
+        self._plane_clicks: list[QPoint] = []
+        self._plane_view_roi = (0.0, 0.0, 1.0, 1.0)
+        self._keyboard_plane_points: tuple[tuple[float, float], ...] | None = None
+        self._drag_start: QPoint | None = None
+        self._drag_current: QPoint | None = None
+        self._zoomed = False
 
     def sizeHint(self) -> QSize:
         return QSize(960, 540)
@@ -159,6 +211,160 @@ class VideoWidget(QWidget):
     def set_frame(self, packet: RenderedFrame) -> None:
         self._packet = packet
         self.update()
+
+    @property
+    def has_frame(self) -> bool:
+        return self._packet is not None
+
+    def set_keyboard_roi(self, roi) -> None:
+        self._keyboard_roi = None if roi is None else tuple(float(v) for v in roi)
+        self.update()
+
+    def set_keyboard_plane(self, points) -> None:
+        self._keyboard_plane_points = normalize_plane_points(points)
+        self.update()
+
+    def set_zoomed(self, zoomed: bool) -> None:
+        self._zoomed = zoomed
+        self.update()
+
+    def begin_roi_selection(self) -> bool:
+        if self._packet is None or self._packet.view_roi != (0.0, 0.0, 1.0, 1.0):
+            return False
+        self._selecting_roi = True
+        self._selecting_plane = False
+        self._plane_clicks.clear()
+        self._drag_start = self._drag_current = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+        return True
+
+    def begin_plane_selection(self) -> bool:
+        if self._packet is None:
+            return False
+        self._selecting_roi = False
+        self._selecting_plane = True
+        self._plane_clicks.clear()
+        self._plane_view_roi = tuple(float(value) for value in self._packet.view_roi)
+        self._drag_start = self._drag_current = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+        return True
+
+    @property
+    def is_full_frame(self) -> bool:
+        if self._packet is None:
+            return False
+        return all(
+            abs(actual - expected) < 1e-6
+            for actual, expected in zip(
+                self._packet.view_roi, (0.0, 0.0, 1.0, 1.0)
+            )
+        )
+
+    @property
+    def selecting_plane(self) -> bool:
+        return self._selecting_plane
+
+    def cancel_plane_selection(self) -> None:
+        self._selecting_plane = False
+        self._plane_clicks.clear()
+        self.unsetCursor()
+        self.update()
+
+    def _clamp_to_image(self, point: QPoint) -> QPoint:
+        return QPoint(
+            max(self._image_rect.left(), min(point.x(), self._image_rect.right())),
+            max(self._image_rect.top(), min(point.y(), self._image_rect.bottom())),
+        )
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._selecting_plane
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._image_rect.contains(event.position().toPoint())
+        ):
+            point = self._clamp_to_image(event.position().toPoint())
+            self._plane_clicks.append(point)
+            prompts = (
+                "center of the Backspace key",
+                "center of the right Ctrl key",
+                "center of the left Ctrl key",
+                "validating keyboard plane",
+            )
+            self.plane_progress.emit(
+                len(self._plane_clicks), prompts[len(self._plane_clicks) - 1]
+            )
+            if len(self._plane_clicks) == 4:
+                roi_x, roi_y, roi_width, roi_height = self._plane_view_roi
+                points = tuple(
+                    (
+                        roi_x
+                        + (
+                            (click.x() - self._image_rect.left())
+                            / self._image_rect.width()
+                        )
+                        * roi_width,
+                        roi_y
+                        + (
+                            (click.y() - self._image_rect.top())
+                            / self._image_rect.height()
+                        )
+                        * roi_height,
+                    )
+                    for click in self._plane_clicks
+                )
+                self._selecting_plane = False
+                self._plane_clicks.clear()
+                self.unsetCursor()
+                self.plane_selected.emit(points)
+            event.accept()
+            self.update()
+            return
+        if (
+            self._selecting_roi
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._image_rect.contains(event.position().toPoint())
+        ):
+            self._drag_start = self._clamp_to_image(event.position().toPoint())
+            self._drag_current = self._drag_start
+            event.accept()
+            self.update()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._selecting_roi and self._drag_start is not None:
+            self._drag_current = self._clamp_to_image(event.position().toPoint())
+            event.accept()
+            self.update()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._selecting_roi
+            and self._drag_start is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            end = self._clamp_to_image(event.position().toPoint())
+            selection = QRect(self._drag_start, end).normalized()
+            self._selecting_roi = False
+            self._drag_start = self._drag_current = None
+            self.unsetCursor()
+            if selection.width() >= 20 and selection.height() >= 20:
+                roi = (
+                    (selection.left() - self._image_rect.left()) / self._image_rect.width(),
+                    (selection.top() - self._image_rect.top()) / self._image_rect.height(),
+                    selection.width() / self._image_rect.width(),
+                    selection.height() / self._image_rect.height(),
+                )
+                self._keyboard_roi = roi
+                self.roi_selected.emit(roi)
+            self.update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     @property
     def render_fps(self) -> float:
@@ -190,8 +396,63 @@ class VideoWidget(QWidget):
             scaled.width(),
             scaled.height(),
         )
+        self._image_rect = target
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.drawImage(target, image)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor("#32d6ff"), 3, Qt.PenStyle.SolidLine))
+        if self._selecting_roi and self._drag_start is not None and self._drag_current is not None:
+            painter.drawRect(QRect(self._drag_start, self._drag_current).normalized())
+        elif self._keyboard_roi is not None and not self._zoomed:
+            x, y, roi_width, roi_height = self._keyboard_roi
+            roi_rect = QRect(
+                target.left() + round(x * target.width()),
+                target.top() + round(y * target.height()),
+                round(roi_width * target.width()),
+                round(roi_height * target.height()),
+            )
+            painter.drawRect(roi_rect)
+
+        if self._selecting_plane:
+            prompts = (
+                "1/4 — CLICK the CENTER of the ` key",
+                "2/4 — CLICK the CENTER of Backspace",
+                "3/4 — CLICK the CENTER of right Ctrl",
+                "4/4 — CLICK the CENTER of left Ctrl",
+            )
+            instruction = prompts[min(len(self._plane_clicks), 3)]
+            banner = QRect(
+                target.left() + 12,
+                target.top() + 12,
+                max(100, target.width() - 24),
+                48,
+            )
+            painter.fillRect(banner, QColor(15, 20, 28, 225))
+            painter.setPen(QPen(QColor("#ffd166"), 2, Qt.PenStyle.SolidLine))
+            painter.drawRect(banner)
+            painter.drawText(
+                banner.adjusted(12, 0, -12, 0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                f"KEYBOARD PLANE CALIBRATION: {instruction} — use the MOUSE on this video",
+            )
+            painter.setPen(QPen(QColor("#ffd166"), 3, Qt.PenStyle.SolidLine))
+            for index, point in enumerate(self._plane_clicks):
+                painter.drawEllipse(point, 6, 6)
+                painter.drawText(point + QPoint(9, -9), str(index + 1))
+            for start, end in zip(self._plane_clicks, self._plane_clicks[1:]):
+                painter.drawLine(start, end)
+        elif self._keyboard_plane_points is not None and not self._zoomed:
+            painter.setPen(QPen(QColor("#ffd166"), 2, Qt.PenStyle.SolidLine))
+            projected = [
+                QPoint(
+                    target.left() + round(x * target.width()),
+                    target.top() + round(y * target.height()),
+                )
+                for x, y in self._keyboard_plane_points
+            ]
+            for start, end in zip(projected, projected[1:] + projected[:1]):
+                painter.drawLine(start, end)
 
         now_ns = time.perf_counter_ns()
         self._paint_times.append(now_ns)
@@ -226,22 +487,39 @@ class TelemetryCard(QFrame):
 
 class CalibrationDialog(QDialog):
     cancelled = Signal()
+    start_requested = Signal(str, int, str)
 
-    def __init__(self, sequence: str, repeats: int, parent=None) -> None:
+    def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._finished = False
+        self._started = False
         self.setWindowTitle("Guided finger calibration")
         self.setModal(False)
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(560)
 
         layout = QVBoxLayout(self)
-        heading = QLabel("Type the highlighted key")
+        heading = QLabel("Guided full-keyboard calibration")
         heading.setStyleSheet("font-size: 18px; font-weight: 700;")
         description = QLabel(
-            f"Sequence: {sequence!r} · {repeats} passes\n"
-            "Wrong keys are ignored. Keep both hands visible and type one prompt at a time."
+            "Choose a key set and complete several passes. Wrong keys are ignored; "
+            "accepted sessions append to your existing personal dataset."
         )
         description.setWordWrap(True)
+
+        options = QFormLayout()
+        self.set_combo = QComboBox()
+        for set_name in CALIBRATION_SETS:
+            self.set_combo.addItem(set_name, set_name)
+        self.rounds_spin = QSpinBox()
+        self.rounds_spin.setRange(5, 10)
+        self.rounds_spin.setValue(5)
+        self.rounds_spin.setSuffix(" passes")
+        self.sequence_label = QLabel("")
+        self.sequence_label.setWordWrap(True)
+        options.addRow("Key set", self.set_combo)
+        options.addRow("Repetitions", self.rounds_spin)
+        options.addRow("Sequence", self.sequence_label)
+
         self.key_label = QLabel("—")
         self.key_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.key_label.setStyleSheet(
@@ -249,19 +527,43 @@ class CalibrationDialog(QDialog):
             "border:2px solid #2188d0;border-radius:12px;padding:18px;"
         )
         self.progress = QProgressBar()
-        self.count_label = QLabel("Waiting for collector…")
+        self.count_label = QLabel("Choose a set, then begin calibration")
         self.message_label = QLabel("")
         self.message_label.setWordWrap(True)
+        self.start_button = QPushButton("Begin Calibration")
+        self.start_button.clicked.connect(self._begin)
         self.cancel_button = QPushButton("Cancel calibration")
         self.cancel_button.clicked.connect(self.reject)
+        self.set_combo.currentIndexChanged.connect(self._update_sequence_label)
+        self.rounds_spin.valueChanged.connect(self._update_sequence_label)
 
         layout.addWidget(heading)
         layout.addWidget(description)
+        layout.addLayout(options)
         layout.addWidget(self.key_label)
         layout.addWidget(self.progress)
         layout.addWidget(self.count_label)
         layout.addWidget(self.message_label)
+        layout.addWidget(self.start_button)
         layout.addWidget(self.cancel_button)
+        self._update_sequence_label()
+        disable_keyboard_focus(self)
+
+    def _update_sequence_label(self, *_args) -> None:
+        sequence = CALIBRATION_SETS[str(self.set_combo.currentData())]
+        visible = sequence.replace(" ", "␠")
+        total = len(sequence) * self.rounds_spin.value()
+        self.sequence_label.setText(f"{visible}  ({total} samples)")
+
+    def _begin(self) -> None:
+        set_name = str(self.set_combo.currentData())
+        sequence = CALIBRATION_SETS[set_name]
+        rounds = self.rounds_spin.value()
+        self._started = True
+        self.set_combo.setEnabled(False)
+        self.rounds_spin.setEnabled(False)
+        self.start_button.setEnabled(False)
+        self.start_requested.emit(sequence, rounds, set_name)
 
     def update_progress(self, update: CalibrationProgress) -> None:
         self.progress.setRange(0, max(1, update.total))
@@ -269,7 +571,10 @@ class CalibrationDialog(QDialog):
         prompt = update.current_key
         self.key_label.setText("SPACE" if prompt == " " else (prompt.upper() or "DONE"))
         self.count_label.setText(
-            f"Accepted {update.accepted}/{update.total} · Ignored {update.rejected}"
+            f"{update.set_name} · Pass {update.round_index or update.rounds}/{update.rounds} · "
+            f"Accepted {update.accepted}/{update.total} · Target samples "
+            f"{update.target_sample_count} · Dataset total {update.dataset_samples} · "
+            f"Ignored {update.rejected}"
         )
         self.message_label.setText(update.message)
         if update.complete:
@@ -278,9 +583,15 @@ class CalibrationDialog(QDialog):
             self.cancel_button.setText("Close")
 
     def reject(self) -> None:
-        if not self._finished:
+        if self._started and not self._finished:
             self.cancelled.emit()
         super().reject()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        event.ignore()
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:
+        event.ignore()
 
 
 class TypingVerifierWindow(QMainWindow):
@@ -293,6 +604,8 @@ class TypingVerifierWindow(QMainWindow):
         calibration_path: Path = DEFAULT_CALIBRATION_PATH,
         finger_model_path: Path = DEFAULT_FINGER_MODEL_PATH,
         spatial_threshold_px: float = 120.0,
+        app_config_path: Path = DEFAULT_APP_CONFIG_PATH,
+        disable_ml: bool = False,
     ):
         super().__init__()
         self.model_path = model_path
@@ -301,13 +614,35 @@ class TypingVerifierWindow(QMainWindow):
         self.calibration_path = Path(calibration_path)
         self.finger_model_path = Path(finger_model_path)
         self.spatial_threshold_px = spatial_threshold_px
+        self.disable_ml = disable_ml
+        self.app_config_path = Path(app_config_path)
+        self._app_config, self._config_warning = self._load_app_config()
+        self.keyboard_roi = normalized_roi(self._app_config.get("keyboard_roi"))
+        self.keyboard_plane_points = normalize_plane_points(
+            self._app_config.get("keyboard_plane_points")
+        )
+        if self.keyboard_plane_points is not None:
+            try:
+                # Recompute this on every launch so older, overly tight crops
+                # are repaired when projection geometry improves.
+                self.keyboard_roi = keyboard_roi_from_points(
+                    self.keyboard_plane_points
+                )
+            except ValueError:
+                self.keyboard_plane_points = None
+        self.digital_zoom = bool(
+            self._app_config.get("digital_zoom", False) and self.keyboard_roi is not None
+        )
         self.camera_thread: CameraThread | None = None
         self.vision_thread: VisionThread | None = None
         self.raw_frames = None
+        self.frame_history: HighResolutionFrameRingBuffer | None = None
         self.rendered_frames = None
         self._last_sequence = -1
         self._latest_telemetry: VisionTelemetry | None = None
         self._last_dashboard_update_ns = 0
+        self._pending_plane_activation = False
+        self._plane_calibration_active = False
         self.calibration_dialog: CalibrationDialog | None = None
         self.training_thread: ModelTrainingThread | None = None
 
@@ -315,9 +650,11 @@ class TypingVerifierWindow(QMainWindow):
         self.resize(1500, 920)
         self.setMinimumSize(1120, 720)
         self._build_ui()
+        disable_keyboard_focus(self)
+        if self._config_warning:
+            self.statusBar().showMessage(self._config_warning)
 
         self.keyboard_thread = KeyboardThread()
-        self.keyboard_thread.escape_requested.connect(self.close)
         self.keyboard_thread.failed.connect(self._show_error)
         self.keyboard_thread.start()
 
@@ -327,6 +664,228 @@ class TypingVerifierWindow(QMainWindow):
         self.refresh_timer.setInterval(16)
         self.refresh_timer.timeout.connect(self._refresh)
         self.refresh_timer.start()
+
+    def _load_app_config(self) -> tuple[dict, str | None]:
+        defaults = {
+            "camera": {
+                "camera_idx": 0,
+                "backend": "msmf",
+                "width": 1920,
+                "height": 1080,
+                "fps": 60.0,
+            },
+            "keyboard_roi": None,
+            "keyboard_plane_points": None,
+            "digital_zoom": False,
+        }
+        if not self.app_config_path.exists():
+            return defaults, None
+        try:
+            loaded = json.loads(self.app_config_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("configuration root must be an object")
+            camera = loaded.get("camera")
+            if isinstance(camera, dict):
+                candidate = {
+                    "camera_idx": int(camera.get("camera_idx", 0)),
+                    "backend": str(camera.get("backend", "msmf")).lower(),
+                    "width": int(camera.get("width", 1920)),
+                    "height": int(camera.get("height", 1080)),
+                    "fps": float(camera.get("fps", 60.0)),
+                }
+                if candidate["camera_idx"] < 0:
+                    raise ValueError("camera index cannot be negative")
+                if candidate["backend"] not in ("msmf", "dshow"):
+                    raise ValueError("camera backend must be msmf or dshow")
+                if candidate["width"] <= 0 or candidate["height"] <= 0 or candidate["fps"] <= 0:
+                    raise ValueError("camera resolution and FPS must be positive")
+                defaults["camera"] = candidate
+            loaded_roi = loaded.get("keyboard_roi")
+            defaults["keyboard_roi"] = normalized_roi(loaded_roi)
+            defaults["keyboard_plane_points"] = normalize_plane_points(
+                loaded.get("keyboard_plane_points")
+            )
+            defaults["digital_zoom"] = bool(
+                loaded.get("digital_zoom", False)
+                and defaults["keyboard_roi"] is not None
+            )
+            return defaults, None
+        except (OSError, ValueError, TypeError) as exc:
+            return defaults, f"Ignoring invalid {self.app_config_path.name}: {exc}"
+
+    def _save_app_config(self) -> None:
+        self._app_config["keyboard_roi"] = (
+            None if self.keyboard_roi is None else list(self.keyboard_roi)
+        )
+        self._app_config["keyboard_plane_points"] = (
+            None
+            if self.keyboard_plane_points is None
+            else [list(point) for point in self.keyboard_plane_points]
+        )
+        self._app_config["digital_zoom"] = self.digital_zoom
+        self.app_config_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.app_config_path.with_suffix(self.app_config_path.suffix + ".part")
+        temporary.write_text(json.dumps(self._app_config, indent=2), encoding="utf-8")
+        os.replace(temporary, self.app_config_path)
+
+    def _on_camera_opened(self, config: CameraConfig) -> None:
+        self._app_config["camera"] = {
+            "camera_idx": config.camera_idx,
+            "backend": config.backend,
+            "width": config.width,
+            "height": config.height,
+            "fps": config.fps,
+        }
+        try:
+            self._save_app_config()
+        except OSError as exc:
+            self.statusBar().showMessage(f"Could not save app settings: {exc}")
+            return
+
+        backend_index = self.backend_combo.findData(config.backend)
+        if backend_index >= 0:
+            self.backend_combo.setCurrentIndex(backend_index)
+        resolution = (config.width, config.height)
+        resolution_index = self.resolution_combo.findData(resolution)
+        if resolution_index < 0:
+            self.resolution_combo.addItem(f"{config.width} × {config.height}", resolution)
+            resolution_index = self.resolution_combo.count() - 1
+        self.resolution_combo.setCurrentIndex(resolution_index)
+
+    def _begin_roi_selection(self) -> None:
+        if not self.video.has_frame:
+            self._show_error("Wait for the first camera frame before setting the keyboard ROI")
+            return
+        if self.zoom_checkbox.isChecked():
+            self.zoom_checkbox.setChecked(False)
+            self.statusBar().showMessage("Returning to the full camera view…")
+            QTimer.singleShot(150, self._activate_roi_selection)
+            return
+        self._activate_roi_selection()
+
+    def _begin_plane_selection(self) -> None:
+        if self._pending_plane_activation or self._plane_calibration_active:
+            self._cancel_plane_selection()
+            return
+        if not self.video.has_frame:
+            self._show_error("Wait for the first camera frame before calibrating the keyboard plane")
+            return
+        self._pending_plane_activation = True
+        self.plane_button.setText("Cancel Plane Calibration")
+        self._show_plane_instruction(
+            "Starting mouse calibration on the current camera view… Do not press the reference keys. "
+            "You will click their positions in the video with the mouse."
+        )
+        self._try_activate_plane_selection()
+
+    def _try_activate_plane_selection(self) -> None:
+        if not self._pending_plane_activation:
+            return
+        if self.video.begin_plane_selection():
+            self._pending_plane_activation = False
+            self._plane_calibration_active = True
+            self._show_plane_instruction(
+                "Calibration 1/4: use the MOUSE to click the CENTER of the ` key "
+                "in the camera preview, regardless of camera rotation."
+            )
+        else:
+            self._show_plane_instruction(
+                "Waiting for a camera frame… calibration will start automatically."
+            )
+
+    def _on_plane_progress(self, completed: int, next_prompt: str) -> None:
+        if completed < 4:
+            self._show_plane_instruction(
+                f"Calibration {completed + 1}/4: use the MOUSE to click the {next_prompt} "
+                "in the camera preview."
+            )
+        else:
+            self._show_plane_instruction("Validating the four-point keyboard plane…")
+
+    def _show_plane_instruction(self, message: str) -> None:
+        self._set_posture("warning", message)
+        self.statusBar().showMessage(message)
+
+    def _finish_plane_selection_ui(self) -> None:
+        self._pending_plane_activation = False
+        self._plane_calibration_active = False
+        self.plane_button.setText("Calibrate Keyboard Plane (4 points)")
+
+    def _cancel_plane_selection(self) -> None:
+        self.video.cancel_plane_selection()
+        self._finish_plane_selection_ui()
+        self._set_posture("info", "Keyboard-plane calibration cancelled")
+        self.statusBar().showMessage("Keyboard-plane calibration cancelled")
+
+    def _on_plane_selected(self, points) -> None:
+        self._finish_plane_selection_ui()
+        selected = normalize_plane_points(points)
+        if selected is None:
+            self._show_error(
+                "Invalid keyboard plane. Click Calibrate Keyboard Plane to retry in "
+                "`, Backspace, right Ctrl, left Ctrl order."
+            )
+            return
+        try:
+            KeyboardPlane(selected)
+        except ValueError as exc:
+            self._show_error(f"Invalid keyboard plane: {exc}")
+            return
+        self.keyboard_plane_points = selected
+        self.keyboard_roi = keyboard_roi_from_points(selected)
+        self.video.set_keyboard_plane(selected)
+        self.video.set_keyboard_roi(self.keyboard_roi)
+        self.zoom_checkbox.setEnabled(True)
+        if self.vision_thread is not None:
+            self.vision_thread.set_keyboard_plane(selected)
+            self.vision_thread.set_keyboard_view(self.keyboard_roi, self.digital_zoom)
+        try:
+            self._save_app_config()
+            message = "Keyboard plane saved; ANSI key polygons are now active"
+            self._set_posture("ok", message)
+            self.statusBar().showMessage(message)
+        except OSError as exc:
+            self._show_error(f"Could not save keyboard plane: {exc}")
+
+    def _activate_roi_selection(self) -> None:
+        if self.video.begin_roi_selection():
+            self.statusBar().showMessage(
+                "Drag from one corner of the physical keyboard to the opposite corner"
+            )
+        else:
+            self.statusBar().showMessage("Waiting for the full camera view; click Set Keyboard ROI again")
+
+    def _on_roi_selected(self, roi) -> None:
+        selected = normalized_roi(roi)
+        if selected is None:
+            self._show_error("Keyboard ROI is too small; draw a larger rectangle")
+            return
+        self.keyboard_roi = selected
+        self.video.set_keyboard_roi(selected)
+        self.zoom_checkbox.setEnabled(True)
+        if self.vision_thread is not None:
+            self.vision_thread.set_keyboard_view(selected, self.digital_zoom)
+        try:
+            self._save_app_config()
+            self.statusBar().showMessage("Keyboard ROI saved")
+        except OSError as exc:
+            self._show_error(f"Could not save keyboard ROI: {exc}")
+
+    def _toggle_digital_zoom(self, enabled: bool) -> None:
+        if enabled and self.keyboard_roi is None:
+            self.zoom_checkbox.blockSignals(True)
+            self.zoom_checkbox.setChecked(False)
+            self.zoom_checkbox.blockSignals(False)
+            self._show_error("Set the keyboard ROI before enabling digital zoom")
+            return
+        self.digital_zoom = bool(enabled)
+        self.video.set_zoomed(self.digital_zoom)
+        if self.vision_thread is not None:
+            self.vision_thread.set_keyboard_view(self.keyboard_roi, self.digital_zoom)
+        try:
+            self._save_app_config()
+        except OSError as exc:
+            self._show_error(f"Could not save digital zoom setting: {exc}")
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -341,6 +900,12 @@ class TypingVerifierWindow(QMainWindow):
         self.posture_banner = QLabel("Initializing posture monitor…")
         self.posture_banner.setObjectName("postureBanner")
         self.video = VideoWidget()
+        self.video.set_keyboard_roi(self.keyboard_roi)
+        self.video.set_keyboard_plane(self.keyboard_plane_points)
+        self.video.set_zoomed(self.digital_zoom)
+        self.video.roi_selected.connect(self._on_roi_selected)
+        self.video.plane_selected.connect(self._on_plane_selected)
+        self.video.plane_progress.connect(self._on_plane_progress)
         self.keystroke_table = self._build_keystroke_table()
         left.addWidget(title)
         left.addWidget(self.posture_banner)
@@ -350,16 +915,29 @@ class TypingVerifierWindow(QMainWindow):
 
         sidebar = QVBoxLayout()
         sidebar.setSpacing(10)
+        sidebar.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         sidebar.addWidget(self._build_controls())
         sidebar.addWidget(self._build_calibration_controls())
         sidebar.addWidget(self._build_dashboard())
         sidebar.addStretch(1)
         sidebar_widget = QWidget()
-        sidebar_widget.setFixedWidth(330)
+        sidebar_widget.setMinimumWidth(320)
         sidebar_widget.setLayout(sidebar)
 
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        sidebar_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sidebar_scroll.setFixedWidth(342)
+        sidebar_scroll.setWidget(sidebar_widget)
+
         root.addLayout(left, 1)
-        root.addWidget(sidebar_widget)
+        root.addWidget(sidebar_scroll)
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Starting background workers…")
@@ -383,17 +961,43 @@ class TypingVerifierWindow(QMainWindow):
             for index in range(4):
                 self.camera_combo.addItem(f"Camera {index}", index)
 
+        saved_camera = self._app_config.get("camera", {})
+        saved_camera_idx = int(saved_camera.get("camera_idx", 0))
+        if self.camera_combo.findData(saved_camera_idx) < 0:
+            self.camera_combo.addItem(f"Camera {saved_camera_idx}", saved_camera_idx)
+        self.camera_combo.setCurrentIndex(self.camera_combo.findData(saved_camera_idx))
+
         self.backend_combo = QComboBox()
-        self.backend_combo.addItem("DirectShow (DSHOW)", "dshow")
         self.backend_combo.addItem("Media Foundation (MSMF)", "msmf")
+        self.backend_combo.addItem("DirectShow (DSHOW)", "dshow")
+        saved_backend = str(saved_camera.get("backend", "msmf")).lower()
+        backend_index = self.backend_combo.findData(saved_backend)
+        self.backend_combo.setCurrentIndex(max(0, backend_index))
 
         self.resolution_combo = QComboBox()
         self.resolution_combo.addItem("1920 × 1080", (1920, 1080))
         self.resolution_combo.addItem("1280 × 720", (1280, 720))
+        saved_resolution = (
+            int(saved_camera.get("width", 1920)),
+            int(saved_camera.get("height", 1080)),
+        )
+        resolution_index = self.resolution_combo.findData(saved_resolution)
+        if resolution_index < 0:
+            self.resolution_combo.addItem(
+                f"{saved_resolution[0]} × {saved_resolution[1]}", saved_resolution
+            )
+            resolution_index = self.resolution_combo.count() - 1
+        self.resolution_combo.setCurrentIndex(resolution_index)
 
         self.fps_combo = QComboBox()
         self.fps_combo.addItem("60 FPS", 60.0)
         self.fps_combo.addItem("30 FPS", 30.0)
+        saved_fps = float(saved_camera.get("fps", 60.0))
+        fps_index = self.fps_combo.findData(saved_fps)
+        if fps_index < 0:
+            self.fps_combo.addItem(f"{saved_fps:g} FPS", saved_fps)
+            fps_index = self.fps_combo.count() - 1
+        self.fps_combo.setCurrentIndex(fps_index)
 
         self.layout_combo = QComboBox()
         for layout_name in LAYOUTS:
@@ -402,28 +1006,69 @@ class TypingVerifierWindow(QMainWindow):
 
         self.apply_button = QPushButton("Apply camera settings")
         self.apply_button.clicked.connect(self._apply_settings)
+        self.roi_button = QPushButton("Set Keyboard ROI")
+        self.roi_button.clicked.connect(self._begin_roi_selection)
+        self.plane_button = QPushButton("Calibrate Keyboard Plane (4 points)")
+        # Prevent QFormLayout/sidebar compression from clipping the Segoe UI
+        # glyph ascent/descent on Windows display scaling above 100%.
+        self.plane_button.setFixedHeight(40)
+        self.plane_button.setToolTip(
+            "Click key centers in this order: `, Backspace, right Ctrl, left Ctrl"
+        )
+        self.plane_button.clicked.connect(self._begin_plane_selection)
+        plane_help = QLabel(
+            "Mouse calibration: click four locations on the live video; do not press those keys."
+        )
+        plane_help.setWordWrap(True)
+        plane_help.setStyleSheet("color:#ffd166;font-size:11px;")
+        self.zoom_checkbox = QCheckBox("Digital Zoom to ROI")
+        self.zoom_checkbox.setChecked(self.digital_zoom)
+        self.zoom_checkbox.setEnabled(self.keyboard_roi is not None)
+        self.zoom_checkbox.toggled.connect(self._toggle_digital_zoom)
         form.addRow("Camera", self.camera_combo)
         form.addRow("Backend", self.backend_combo)
         form.addRow("Resolution", self.resolution_combo)
         form.addRow("Target FPS", self.fps_combo)
         form.addRow("Keyboard", self.layout_combo)
         form.addRow(self.apply_button)
+        form.addRow(self.roi_button)
+        form.addRow(self.plane_button)
+        form.addRow(plane_help)
+        form.addRow(self.zoom_checkbox)
+        form.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        group.setMinimumHeight(group.sizeHint().height())
+        group.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
+        )
         return group
 
     def _build_calibration_controls(self) -> QGroupBox:
-        group = QGroupBox("Personal finger model")
+        group = QGroupBox("Legacy personal finger model")
         layout = QVBoxLayout(group)
         explanation = QLabel(
-            "Collect key-aligned motion samples, then train a local lightweight classifier."
+            "Optional fallback when no keyboard plane is available. The contact verifier "
+            "does not require model training."
         )
         explanation.setWordWrap(True)
         self.calibrate_button = QPushButton("Start Guided Calibration")
         self.train_button = QPushButton("Train Model")
         self.calibrate_button.clicked.connect(self._start_calibration)
         self.train_button.clicked.connect(self._train_model)
+        if self.disable_ml:
+            explanation.setText(
+                "ML is disabled. Runtime decisions use only the calibrated keyboard plane "
+                "and key-conditioned fingertip trajectories."
+            )
+            self.calibrate_button.setEnabled(False)
+            self.train_button.setEnabled(False)
         layout.addWidget(explanation)
         layout.addWidget(self.calibrate_button)
         layout.addWidget(self.train_button)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        group.setMinimumHeight(group.sizeHint().height())
+        group.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
+        )
         return group
 
     def _build_dashboard(self) -> QGroupBox:
@@ -437,6 +1082,11 @@ class TypingVerifierWindow(QMainWindow):
         grid.addWidget(self.render_card, 0, 1)
         grid.addWidget(self.latency_card, 1, 0)
         grid.addWidget(self.delta_card, 1, 1)
+        grid.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        group.setMinimumHeight(group.sizeHint().height())
+        group.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
+        )
         return group
 
     @staticmethod
@@ -470,16 +1120,19 @@ class TypingVerifierWindow(QMainWindow):
 
     def _start_pipeline(self) -> None:
         self.raw_frames = LatestValueSlot()
+        self.frame_history = HighResolutionFrameRingBuffer(duration_ns=250_000_000)
         self.rendered_frames = LatestValueSlot()
         self._last_sequence = -1
         config = self._selected_config()
-        self.camera_thread = CameraThread(config, self.raw_frames)
+        self.camera_thread = CameraThread(config, self.raw_frames, self.frame_history)
         self.camera_thread.ready.connect(self.statusBar().showMessage)
+        self.camera_thread.opened.connect(self._on_camera_opened)
         self.camera_thread.camera_error.connect(self._show_error)
         self.camera_thread.failed.connect(self._show_error)
         self.vision_thread = VisionThread(
             model_path=self.model_path,
             raw_frames=self.raw_frames,
+            frame_history=self.frame_history,
             rendered_frames=self.rendered_frames,
             camera=self.camera_thread,
             keyboard=self.keyboard_thread,
@@ -489,6 +1142,10 @@ class TypingVerifierWindow(QMainWindow):
             calibration_path=self.calibration_path,
             finger_model_path=self.finger_model_path,
             spatial_threshold_px=self.spatial_threshold_px,
+            keyboard_roi=self.keyboard_roi,
+            keyboard_plane_points=self.keyboard_plane_points,
+            digital_zoom=self.digital_zoom,
+            disable_ml=self.disable_ml,
         )
         self.vision_thread.ready.connect(self.statusBar().showMessage)
         self.vision_thread.failed.connect(self._show_error)
@@ -517,18 +1174,27 @@ class TypingVerifierWindow(QMainWindow):
         self.apply_button.setEnabled(True)
 
     def _start_calibration(self) -> None:
+        if self.disable_ml:
+            self._show_error("ML is disabled; guided model calibration is unavailable")
+            return
         if self.vision_thread is None:
             self._show_error("Vision worker is not running")
             return
         if self.calibration_dialog is not None:
             self.calibration_dialog.close()
-        dialog = CalibrationDialog(DEFAULT_SEQUENCE, 5, self)
+        dialog = CalibrationDialog(self)
         dialog.cancelled.connect(self._cancel_calibration)
+        dialog.start_requested.connect(self._begin_calibration_session)
         dialog.finished.connect(lambda _result: self._clear_calibration_dialog(dialog))
         self.calibration_dialog = dialog
         dialog.show()
         dialog.raise_()
-        self.vision_thread.start_calibration(DEFAULT_SEQUENCE, 5)
+
+    def _begin_calibration_session(
+        self, sequence: str, rounds: int, set_name: str
+    ) -> None:
+        if self.vision_thread is not None:
+            self.vision_thread.start_calibration(sequence, rounds, set_name)
 
     def _cancel_calibration(self) -> None:
         if self.vision_thread is not None:
@@ -547,6 +1213,9 @@ class TypingVerifierWindow(QMainWindow):
         self.statusBar().showMessage(f"Calibration dataset saved: {path}")
 
     def _train_model(self) -> None:
+        if self.disable_ml:
+            self._show_error("ML is disabled; no model will be loaded or trained")
+            return
         if self.training_thread is not None and self.training_thread.isRunning():
             return
         if not self.calibration_path.exists():
@@ -586,6 +1255,8 @@ class TypingVerifierWindow(QMainWindow):
             self._last_sequence = packet.sequence
             self._latest_telemetry = packet.telemetry
             self.video.set_frame(packet)
+            if self._pending_plane_activation and self.video.has_frame:
+                self._try_activate_plane_selection()
 
         now_ns = time.perf_counter_ns()
         if now_ns - self._last_dashboard_update_ns < 100_000_000:
@@ -600,6 +1271,8 @@ class TypingVerifierWindow(QMainWindow):
         self.delta_card.set_value(
             "—" if telemetry.key_frame_delta_ms is None else f"{telemetry.key_frame_delta_ms:+.1f}"
         )
+        if self._pending_plane_activation or self._plane_calibration_active:
+            return
         self._set_posture(telemetry.posture.severity, telemetry.posture.message)
         self.statusBar().showMessage(
             f"MediaPipe {telemetry.mediapipe_fps:.1f} FPS · "
@@ -626,18 +1299,33 @@ class TypingVerifierWindow(QMainWindow):
         self.statusBar().showMessage(message)
 
     def _append_keystroke(self, record: KeystrokeRecord) -> None:
+        # Four-point plane calibration is mouse-only. Hide incidental physical
+        # key presses so they cannot be mistaken for calibration input.
+        if self._pending_plane_activation or self._plane_calibration_active:
+            return
         table = self.keystroke_table
         table.insertRow(0)
-        values = (record.timestamp, record.key, record.expected, record.observed)
+        observed = record.observed
+        if observed == "Unknown" and record.rejection_reason:
+            observed = f"Unknown ({record.rejection_reason})"
+        decision_tooltip = (
+            f"Decision source: {record.decision_source}\n"
+            f"Confidence: {record.confidence:.1%}\n"
+            f"Guardrail: {record.rejection_reason or 'Accepted'}"
+        )
+        values = (record.timestamp, record.key, record.expected, observed)
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
             if column in (0, 1):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if column == 3:
+                item.setToolTip(decision_tooltip)
             table.setItem(0, column, item)
 
         confidence = QLabel(f"{record.confidence:.0%}")
         confidence.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        if record.confidence >= 0.65:
+        confidence.setToolTip(decision_tooltip)
+        if record.confidence >= 0.60:
             colors = ("#153b29", "#65e69b")
         elif record.confidence >= 0.35:
             colors = ("#453713", "#ffd166")
@@ -650,6 +1338,12 @@ class TypingVerifierWindow(QMainWindow):
         table.setCellWidget(0, 4, confidence)
         if table.rowCount() > 200:
             table.removeRow(table.rowCount() - 1)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        event.ignore()
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:
+        event.ignore()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.refresh_timer.stop()
@@ -668,6 +1362,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--inference-fps", type=float, default=30.0)
     parser.add_argument("--calibration-data", type=Path, default=DEFAULT_CALIBRATION_PATH)
     parser.add_argument("--finger-model", type=Path, default=DEFAULT_FINGER_MODEL_PATH)
+    parser.add_argument(
+        "--disable-ml",
+        action="store_true",
+        help="Do not load, reload, collect for, or train the legacy finger classifier",
+    )
+    parser.add_argument("--app-config", type=Path, default=DEFAULT_APP_CONFIG_PATH)
     parser.add_argument("--spatial-threshold-px", type=float, default=120.0)
     return parser.parse_args(argv)
 
@@ -698,6 +1398,8 @@ def main() -> int:
         calibration_path=args.calibration_data,
         finger_model_path=args.finger_model,
         spatial_threshold_px=args.spatial_threshold_px,
+        app_config_path=args.app_config,
+        disable_ml=args.disable_ml,
     )
     window.show()
     return app.exec()

@@ -305,9 +305,15 @@ class CaptureWorker(threading.Thread):
 class KeyboardCollector:
     """Non-blocking keyboard callbacks backed by a bounded queue."""
 
-    def __init__(self, stop_event: threading.Event) -> None:
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        *,
+        stop_on_escape: bool = True,
+    ) -> None:
         self.events: queue.Queue[KeyEvent] = queue.Queue(maxsize=KEY_QUEUE_SIZE)
         self.stop_event = stop_event
+        self.stop_on_escape = stop_on_escape
         self.listener: keyboard.Listener | None = None
         self._sequence = itertools.count()
         self._dropped = 0
@@ -338,7 +344,7 @@ class KeyboardCollector:
             with self._dropped_lock:
                 self._dropped += 1
 
-        if action == "press" and key == keyboard.Key.esc:
+        if self.stop_on_escape and action == "press" and key == keyboard.Key.esc:
             self.stop_event.set()
             return False
         return None

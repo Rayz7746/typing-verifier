@@ -14,6 +14,8 @@ import mediapipe as mp
 import numpy as np
 from mediapipe.tasks.python import vision
 
+from keyboard_geometry import KeyboardPlane
+
 
 NS_PER_SECOND = 1_000_000_000
 KEY_MATCH_WINDOW_NS = 80_000_000
@@ -40,6 +42,27 @@ FINGER_COLORS = {
     "ring": (255, 130, 220),
     "pinky": (180, 120, 255),
 }
+FULL_FRAME_ROI = (0.0, 0.0, 1.0, 1.0)
+
+
+def normalized_roi(roi) -> tuple[float, float, float, float] | None:
+    if roi is None or len(roi) != 4:
+        return None
+    x, y, width, height = (float(value) for value in roi)
+    x = float(np.clip(x, 0.0, 1.0))
+    y = float(np.clip(y, 0.0, 1.0))
+    width = float(np.clip(width, 0.0, 1.0 - x))
+    height = float(np.clip(height, 0.0, 1.0 - y))
+    if width < 0.02 or height < 0.02:
+        return None
+    return x, y, width, height
+
+
+def point_in_roi(
+    point: tuple[float, float], roi: tuple[float, float, float, float]
+) -> bool:
+    x, y, width, height = roi
+    return x <= point[0] <= x + width and y <= point[1] <= y + height
 
 
 class OneEuroFilter:
@@ -135,10 +158,180 @@ class HybridPrediction:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class ContactVerification:
+    """Result of a key-conditioned, model-free contact decision."""
+
+    label: str
+    confidence: float
+    reason: str
+    proximity_score: float = 0.0
+    stroke_score: float = 0.0
+    reversal_score: float = 0.0
+    distance_px: float | None = None
+
+
+class KeyConditionedContactVerifier:
+    """Identify the finger whose trajectory best explains a known keydown.
+
+    The OS hook supplies the target key.  The verifier therefore compares each
+    visible fingertip only against that key's projected polygon instead of
+    trying to learn a global pose-to-finger mapping.
+    """
+
+    def __init__(self, *, minimum_score: float = 0.42, ambiguity_margin: float = 0.035):
+        self.minimum_score = minimum_score
+        self.ambiguity_margin = ambiguity_margin
+
+    @staticmethod
+    def _median(values: list[float]) -> float | None:
+        return None if not values else float(np.median(np.asarray(values)))
+
+    def verify(
+        self,
+        key_label: str,
+        key_timestamp_ns: int,
+        snapshots: tuple[KinematicsSnapshot, ...],
+        keyboard_plane: KeyboardPlane | None,
+        frame_size: tuple[int, int],
+        *,
+        frame_timestamps: tuple[int, ...] = (),
+    ) -> ContactVerification:
+        if keyboard_plane is None:
+            return ContactVerification("Unknown", 0.0, "Keyboard Plane Not Calibrated")
+        if keyboard_plane.key_polygon(key_label) is None:
+            return ContactVerification("Unknown", 0.0, "Unmapped Key")
+        if frame_timestamps:
+            relative = [timestamp - key_timestamp_ns for timestamp in frame_timestamps]
+            # Allow roughly one 30 FPS interval of timestamp quantization at
+            # either edge of the requested [-150 ms, +50 ms] trajectory.
+            if min(relative) > -130_000_000 or max(relative) < 30_000_000:
+                return ContactVerification("Unknown", 0.0, "Incomplete Frame Window")
+
+        trajectories: dict[str, list[tuple[float, tuple[float, float], float, float]]] = {}
+        for snapshot in snapshots:
+            relative_ms = (snapshot.timestamp_ns - key_timestamp_ns) / 1_000_000.0
+            if relative_ms < -150.0 or relative_ms > 50.0:
+                continue
+            for hand in snapshot.hands:
+                for finger, tip_index in TIP_INDICES.items():
+                    label = f"{hand.handedness} {finger}"
+                    point = hand.image_landmarks[tip_index, :2]
+                    trajectories.setdefault(label, []).append(
+                        (
+                            relative_ms,
+                            (float(point[0]), float(point[1])),
+                            float(hand.local_landmarks[tip_index, 2]),
+                            float(hand.downward_velocity[finger]),
+                        )
+                    )
+
+        if not trajectories:
+            return ContactVerification("Unknown", 0.0, "No Hand Landmarks in Window")
+
+        candidates: list[ContactVerification] = []
+        for label, samples in trajectories.items():
+            samples.sort(key=lambda value: value[0])
+            contact_samples = [sample for sample in samples if -70.0 <= sample[0] <= 50.0]
+            if len(samples) < 2 or not contact_samples:
+                continue
+
+            distances = [
+                keyboard_plane.distance_to_key_px(key_label, sample[1], frame_size)
+                for sample in contact_samples
+            ]
+            distances = [distance for distance in distances if distance is not None]
+            if not distances:
+                continue
+            distance_px, key_diagonal_px = min(distances, key=lambda value: value[0])
+            proximity = math.exp(-distance_px / max(0.85 * key_diagonal_px, 1.0))
+
+            early_z = self._median([sample[2] for sample in samples if -150.0 <= sample[0] <= -55.0])
+            contact_z = self._median([sample[2] for sample in samples if -45.0 <= sample[0] <= 20.0])
+            release_z = self._median([sample[2] for sample in samples if 20.0 <= sample[0] <= 50.0])
+            displacement_down = (
+                max(0.0, early_z - contact_z)
+                if early_z is not None and contact_z is not None
+                else 0.0
+            )
+            displacement_up = (
+                max(0.0, release_z - contact_z)
+                if release_z is not None and contact_z is not None
+                else 0.0
+            )
+            peak_down_velocity = max(
+                (sample[3] for sample in samples if -120.0 <= sample[0] <= 25.0),
+                default=0.0,
+            )
+            stroke = max(
+                min(displacement_down / 0.055, 1.0),
+                min(peak_down_velocity / 1.8, 1.0),
+            )
+            reversal = math.sqrt(
+                min(displacement_down / 0.045, 1.0)
+                * min(displacement_up / 0.030, 1.0)
+            )
+            spatial_gate = 0.20 + 0.80 * proximity
+            score = float(
+                np.clip(
+                    0.55 * proximity
+                    + spatial_gate * (0.30 * stroke + 0.15 * reversal),
+                    0.0,
+                    1.0,
+                )
+            )
+            candidates.append(
+                ContactVerification(
+                    label,
+                    score,
+                    "Accepted",
+                    proximity,
+                    stroke,
+                    reversal,
+                    distance_px,
+                )
+            )
+
+        if not candidates:
+            available_frames = max(
+                (len(samples) for samples in trajectories.values()), default=0
+            )
+            return ContactVerification(
+                "Unknown",
+                0.0,
+                f"Insufficient Trajectory: {available_frames} landmark frame(s)",
+            )
+        candidates.sort(key=lambda item: item.confidence, reverse=True)
+        best = candidates[0]
+        runner_up = candidates[1].confidence if len(candidates) > 1 else 0.0
+        if best.confidence < self.minimum_score:
+            return ContactVerification(
+                "Unknown",
+                best.confidence,
+                f"Weak Contact: {best.confidence:.0%} < {self.minimum_score:.0%}",
+                best.proximity_score,
+                best.stroke_score,
+                best.reversal_score,
+                best.distance_px,
+            )
+        if best.confidence < 0.65 and best.confidence - runner_up < self.ambiguity_margin:
+            return ContactVerification(
+                "Unknown",
+                best.confidence,
+                f"Ambiguous Contact: margin {(best.confidence - runner_up):.0%}",
+                best.proximity_score,
+                best.stroke_score,
+                best.reversal_score,
+                best.distance_px,
+            )
+        return best
+
+
 @dataclass(slots=True)
 class _TrackState:
     world_filter: OneEuroFilter
     image_filter: OneEuroFilter
+    local_filter: OneEuroFilter
     timestamp_ns: int | None = None
     local_landmarks: np.ndarray | None = None
     image_landmarks: np.ndarray | None = None
@@ -202,10 +395,15 @@ class HybridDecisionEngine:
         *,
         minimum_confidence: float = 0.60,
         spatial_threshold_px: float = 120.0,
+        keyboard_roi: tuple[float, float, float, float] | None = None,
     ) -> None:
         self.classifier = classifier
         self.minimum_confidence = minimum_confidence
         self.spatial_threshold_px = spatial_threshold_px
+        self.keyboard_roi = normalized_roi(keyboard_roi)
+
+    def set_keyboard_roi(self, roi) -> None:
+        self.keyboard_roi = normalized_roi(roi)
 
     def classify(
         self,
@@ -218,32 +416,46 @@ class HybridDecisionEngine:
         heuristic_confidence: float = 0.0,
     ) -> HybridPrediction:
         if self.classifier is None:
-            return HybridPrediction(
+            label, confidence, source = (
                 heuristic_label,
                 heuristic_confidence,
-                None,
                 "heuristic",
-                "No trained model is loaded",
             )
+        else:
+            label, confidence = self.classifier.predict_one(features)
+            source = "ml"
 
-        label, confidence = self.classifier.predict_one(features)
-        if confidence < self.minimum_confidence:
-            return HybridPrediction(
-                "Unknown", confidence, None, "ml", "Below confidence threshold"
-            )
-
-        target = self.classifier.target_for_key(key_label)
         fingertip = fingertip_positions.get(label)
         distance_px: float | None = None
+        if fingertip is None:
+            reason = (
+                "No Active Finger"
+                if label == "Unknown" and fingertip_positions
+                else "Hand Occluded"
+            )
+            return HybridPrediction(
+                "Unknown", confidence, None, source, reason
+            )
+        if self.keyboard_roi is not None and not point_in_roi(fingertip, self.keyboard_roi):
+            return HybridPrediction(
+                "Unknown", confidence, None, source, "Outside ROI"
+            )
+        if source == "ml" and confidence < self.minimum_confidence:
+            return HybridPrediction(
+                "Unknown",
+                confidence,
+                None,
+                "ml",
+                f"Low Conf: {confidence:.0%} < {self.minimum_confidence:.0%}",
+            )
+        if self.classifier is None:
+            return HybridPrediction(label, confidence, None, source, "Accepted heuristic")
+
+        target = self.classifier.target_for_key(key_label)
         if target is None:
             return HybridPrediction(
-                "Unknown", confidence, None, "ml", "No calibrated region exists for this key"
+                "Unknown", confidence, None, "ml", "Uncalibrated Key Region"
             )
-        if fingertip is None:
-            return HybridPrediction(
-                "Unknown", confidence, None, "ml", "Predicted fingertip is not currently visible"
-            )
-
         width, height = frame_size
         dx = (fingertip[0] - target[0]) * width
         dy = (fingertip[1] - target[1]) * height
@@ -254,7 +466,7 @@ class HybridDecisionEngine:
                 confidence,
                 distance_px,
                 "ml",
-                "Predicted fingertip is outside the calibrated key region",
+                f"Key Distance: {distance_px:.0f}px > {self.spatial_threshold_px:.0f}px",
             )
 
         return HybridPrediction(label, confidence, distance_px, "ml", "Accepted")
@@ -313,7 +525,12 @@ class KinematicsEngine:
             score,
         )
 
-    def process_result(self, result: vision.HandLandmarkerResult, timestamp_ns: int) -> None:
+    def process_result(
+        self,
+        result: vision.HandLandmarkerResult,
+        timestamp_ns: int,
+        image_roi: tuple[float, float, float, float] = FULL_FRAME_ROI,
+    ) -> None:
         time_s = timestamp_ns / NS_PER_SECOND
         analyses: list[HandAnalysis] = []
 
@@ -326,12 +543,18 @@ class KinematicsEngine:
                 handedness_score = float(category.score) if category else 0.0
                 track = self._tracks.setdefault(
                     handedness,
-                    _TrackState(OneEuroFilter(), OneEuroFilter()),
+                    _TrackState(OneEuroFilter(), OneEuroFilter(), OneEuroFilter()),
                 )
 
                 image_points = np.array(
                     [[point.x, point.y, point.z] for point in image_hand], dtype=np.float64
                 )
+                roi_x, roi_y, roi_width, roi_height = image_roi
+                image_points[:, 0] = roi_x + image_points[:, 0] * roi_width
+                image_points[:, 1] = roi_y + image_points[:, 1] * roi_height
+                # MediaPipe landmark Z uses approximately the same normalized
+                # scale as image X, so restore it to full-frame width units.
+                image_points[:, 2] *= roi_width
                 world_points = np.array(
                     [
                         [point.x, point.y, point.z]
@@ -343,7 +566,12 @@ class KinematicsEngine:
                 filtered_world = track.world_filter.filter(world_points, time_s)
 
                 try:
-                    local, palm_basis = _palm_local_frame(filtered_world)
+                    # Canonicalize each result before temporal filtering. This
+                    # removes MediaPipe world-scale changes caused by ROI crop
+                    # context before coordinates and velocities enter features.
+                    raw_local, _raw_basis = _palm_local_frame(world_points)
+                    local = track.local_filter.filter(raw_local, time_s)
+                    _posture_local, palm_basis = _palm_local_frame(filtered_world)
                     flexion = {
                         name: _finger_flexion(local, joints)
                         for name, joints in FINGER_JOINTS.items()
@@ -468,6 +696,7 @@ class HandInferencePipeline:
         self._result_times: deque[int] = deque()
         self._latency_ms = 0.0
         self._error: str | None = None
+        self._source_rois: dict[int, tuple[float, float, float, float]] = {}
 
         options = vision.HandLandmarkerOptions(
             base_options=mp.tasks.BaseOptions(
@@ -483,7 +712,12 @@ class HandInferencePipeline:
         )
         self._landmarker = vision.HandLandmarker.create_from_options(options)
 
-    def submit(self, frame_bgr: np.ndarray, frame_timestamp_ns: int) -> bool:
+    def submit(
+        self,
+        frame_bgr: np.ndarray,
+        frame_timestamp_ns: int,
+        source_roi: tuple[float, float, float, float] = FULL_FRAME_ROI,
+    ) -> bool:
         minimum_interval_ns = int(NS_PER_SECOND / self.max_fps)
         if frame_timestamp_ns - self._last_submit_ns < minimum_interval_ns:
             return False
@@ -495,7 +729,18 @@ class HandInferencePipeline:
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
-        self._landmarker.detect_async(image, int(timestamp_ms))
+        roi = normalized_roi(source_roi) or FULL_FRAME_ROI
+        with self._lock:
+            self._source_rois[int(timestamp_ms)] = roi
+            if len(self._source_rois) > 32:
+                oldest = min(self._source_rois)
+                self._source_rois.pop(oldest, None)
+        try:
+            self._landmarker.detect_async(image, int(timestamp_ms))
+        except BaseException:
+            with self._lock:
+                self._source_rois.pop(int(timestamp_ms), None)
+            raise
         self._last_submit_ns = frame_timestamp_ns
         self._last_timestamp_ms = int(timestamp_ms)
         with self._lock:
@@ -512,7 +757,9 @@ class HandInferencePipeline:
             if self._clock_origin_ns is None:
                 return
             frame_timestamp_ns = self._clock_origin_ns + timestamp_ms * 1_000_000
-            self.engine.process_result(result, frame_timestamp_ns)
+            with self._lock:
+                source_roi = self._source_rois.pop(timestamp_ms, FULL_FRAME_ROI)
+            self.engine.process_result(result, frame_timestamp_ns, source_roi)
             now_ns = time.perf_counter_ns()
             with self._lock:
                 self._completed += 1
@@ -539,13 +786,21 @@ class HandInferencePipeline:
         self._landmarker.close()
 
 
-def draw_hand_overlay(frame: np.ndarray, snapshot: KinematicsSnapshot) -> None:
+def draw_hand_overlay(
+    frame: np.ndarray,
+    snapshot: KinematicsSnapshot,
+    view_roi: tuple[float, float, float, float] = FULL_FRAME_ROI,
+) -> None:
     height, width = frame.shape[:2]
     prediction = snapshot.key_prediction
+    roi_x, roi_y, roi_width, roi_height = view_roi
 
     for hand in snapshot.hands:
+        view_points = hand.image_landmarks.copy()
+        view_points[:, 0] = (view_points[:, 0] - roi_x) / roi_width
+        view_points[:, 1] = (view_points[:, 1] - roi_y) / roi_height
         points = np.column_stack(
-            (hand.image_landmarks[:, 0] * width, hand.image_landmarks[:, 1] * height)
+            (view_points[:, 0] * width, view_points[:, 1] * height)
         ).astype(np.int32)
         for start, end in HAND_CONNECTIONS:
             cv2.line(frame, tuple(points[start]), tuple(points[end]), (190, 190, 190), 1, cv2.LINE_AA)
@@ -559,7 +814,9 @@ def draw_hand_overlay(frame: np.ndarray, snapshot: KinematicsSnapshot) -> None:
         for name, tip_index in TIP_INDICES.items():
             start = points[tip_index]
             velocity = hand.tip_velocity_image[name]
-            vector = np.array([velocity[0] * width, velocity[1] * height]) * 0.06
+            vector = np.array(
+                [velocity[0] * width / roi_width, velocity[1] * height / roi_height]
+            ) * 0.06
             magnitude = float(np.linalg.norm(vector))
             if magnitude > 70.0:
                 vector *= 70.0 / magnitude
