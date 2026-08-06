@@ -5,3 +5,8 @@ models/*.task
 models/*.part
 app_config.json
 app_config.json.part
+build/
+dist/
+*.zip
+*.sha256
+build-diagnostic-output.txt
