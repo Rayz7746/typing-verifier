@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
 from collections import deque
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from types import TracebackType
 
 from qt_bootstrap import prepare_qt_runtime
 
@@ -32,6 +35,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLayout,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -42,7 +46,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from fetch_model import DEFAULT_MODEL_PATH, ensure_model
+from fetch_model import ensure_model
 from keyboard_geometry import (
     KeyboardPlane,
     keyboard_roi_from_points,
@@ -63,7 +67,103 @@ from ui_workers import (
 )
 
 
-DEFAULT_APP_CONFIG_PATH = Path(__file__).resolve().with_name("app_config.json")
+APPLICATION_FOLDER_NAME = "TypingVerifier"
+LOG_FILE_NAME = "typing-verifier.log"
+
+
+def get_user_data_dir() -> Path:
+    """Return the directory used for writable, per-user application data."""
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data).expanduser().resolve() / APPLICATION_FOLDER_NAME
+    # LOCALAPPDATA is present on supported Windows installations. This fallback
+    # keeps development and diagnostics usable in stripped-down environments.
+    return Path.home().resolve() / "AppData" / "Local" / APPLICATION_FOLDER_NAME
+
+
+def get_asset_path(relative_path: str) -> str:
+    """Resolve a source-tree or PyInstaller-bundled static resource."""
+
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    base_dir = Path(bundle_dir) if bundle_dir else Path.cwd()
+    return str((base_dir / relative_path).resolve())
+
+
+USER_DATA_DIR = get_user_data_dir()
+LOGS_DIR = USER_DATA_DIR / "logs"
+LOG_FILE_PATH = LOGS_DIR / LOG_FILE_NAME
+DEFAULT_APP_CONFIG_PATH = USER_DATA_DIR / "app_config.json"
+DEFAULT_MODEL_PATH = Path(get_asset_path("models/hand_landmarker.task"))
+
+
+def setup_logging() -> Path:
+    """Configure production logging and return the active log file path."""
+
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] [%(threadName)s] %(name)s: %(message)s"
+    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+        handler.close()
+
+    file_handler = RotatingFileHandler(
+        LOG_FILE_PATH,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+    if not getattr(sys, "frozen", False):
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        root_logger.addHandler(stream_handler)
+
+    return LOG_FILE_PATH
+
+
+def handle_uncaught_exception(
+    exception_type: type[BaseException],
+    exception: BaseException,
+    traceback: TracebackType | None,
+) -> None:
+    """Log uncaught exceptions and direct the user to the diagnostic log."""
+
+    if issubclass(exception_type, KeyboardInterrupt):
+        sys.__excepthook__(exception_type, exception, traceback)
+        return
+
+    logging.getLogger(__name__).critical(
+        "Uncaught exception",
+        exc_info=(exception_type, exception, traceback),
+    )
+
+    temporary_app = None
+    try:
+        if QApplication.instance() is None:
+            temporary_app = QApplication(sys.argv[:1])
+        QMessageBox.critical(
+            None,
+            "Typing Verifier - Fatal Error",
+            "A fatal error occurred and the application must close.\n\n"
+            f"Details were written to:\n{LOG_FILE_PATH}",
+        )
+    except BaseException:
+        logging.getLogger(__name__).exception("Could not display the fatal error dialog")
+    finally:
+        del temporary_app
+
+
+def install_exception_handler() -> None:
+    """Install the process-wide handler for uncaught main-thread exceptions."""
+
+    sys.excepthook = handle_uncaught_exception
 
 
 APP_STYLE = """
@@ -1119,14 +1219,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main() -> int:
+    setup_logging()
+    install_exception_handler()
+    logger = logging.getLogger(__name__)
+    logger.info("Starting Touch-Typing Verifier")
+
     args = parse_args()
     if args.processing_height <= 0 or args.inference_fps <= 0:
-        print("processing height and inference FPS must be positive", file=sys.stderr)
+        logger.error("processing height and inference FPS must be positive")
         return 2
     try:
         model_path = ensure_model(args.model)
-    except BaseException as exc:
-        print(f"Model setup failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        logger.exception("Model setup failed: %s", exc)
         return 1
 
     app = QApplication(sys.argv[:1])
